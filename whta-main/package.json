@@ -1,7 +1,7 @@
 {
-  "name": "dazbot",
+  "name": "davidbot",
   "version": "1.0.0",
-  "description": "WhatsApp bot DazBot dedicated to status detection and reactions",
+  "description": "WhatsApp bot DavidBot (David) dedicated to status detection and reactions",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

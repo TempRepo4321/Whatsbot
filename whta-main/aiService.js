@@ -1,8 +1,8 @@
 /*
  * aiService.js — wrapper OpenRouter / OpenAI / Gemini pour le chatbot IA
- * intégré à DazBot.
+ * intégré à david.
  *
- * Porté depuis dazbot-1/Chat-Bot-Dazi (src/services/openaiService.js) :
+ * Porté depuis david-1/Chat-Bot-Dav (src/services/openaiService.js) :
  *   - Compatibilité OpenRouter, OpenAI ET Gemini (Gemini expose un endpoint
  *     OpenAI-compatible : /v1beta/openai/chat/completions). Même code pour
  *     les 3 providers, seule la baseURL + l'auth change.
@@ -10,7 +10,7 @@
  *     aiMaxContextMessages).
  *   - Prompt système = personality.json (systemPrompt + description +
  *     examples).
- *   - Pas de Supabase (volontairement retiré : on garde DazBot simple).
+ *   - Pas de Supabase (volontairement retiré : on garde david simple).
  *
  * Dépendances : axios (déjà présent dans package.json).
  */
@@ -28,7 +28,7 @@ function normalizeConversationId(conversationId) {
 }
 
 // Charge personality.json et retourne un objet avec les différents modes
-// de personnalité supportés. `default` = Daziano standard, `romantic` =
+// de personnalité supportés. `default` = dav standard, `romantic` =
 // mode copine (mots doux, ton affectueux). On accepte aussi l'ancienne
 // forme ({ personality: {...} }) pour rétro-compatibilité : elle est
 // mappée sur `default`.
@@ -109,12 +109,14 @@ class AIService {
             this.apiKey = apiKey;
             this.baseURL = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
             this.extraHeaders = {
-                'HTTP-Referer': process.env.OPENROUTER_HTTP_REFERER || 'https://github.com/dazbot-1/DazBot',
-                'X-Title': process.env.OPENROUTER_X_TITLE || 'DazBot',
+                'HTTP-Referer': process.env.OPENROUTER_HTTP_REFERER || 'https://github.com/dav/DavidBot',
+                'X-Title': process.env.OPENROUTER_X_TITLE || 'DavidBot',
             };
             this.provider = 'openrouter';
         } else if (provider === 'haoduomi') {
-            const apiKey = process.env.API_KEY;
+            // `HHAODUMIAI_API_KEY` (nom dédié, prioritaire) avec fallback sur
+            // le générique `API_KEY` documenté dans SKILL.md (好多米Ai).
+            const apiKey = process.env.HHAODUMIAI_API_KEY || process.env.API_KEY;
             if (!apiKey) {
                 throw new Error('API_KEY manquante dans l\'environnement.');
             }
@@ -158,7 +160,7 @@ class AIService {
         this.personality = loadPersonality();
     }
 
-    // `mode` : 'default' (Daziano standard) ou 'romantic' (copine, mots doux).
+    // `mode` : 'default' (dav standard) ou 'romantic' (copine, mots doux).
     // Fallback automatique sur 'default' si un mode demandé n'est pas défini
     // dans personality.json — comme ça un personality.json simple qui ne
     // contient que la section standard ne casse rien.

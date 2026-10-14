@@ -34,7 +34,7 @@ module.exports = {
     // Nom du propriétaire affiché dans le message de connexion envoyé
     // dans la discussion perso au démarrage du bot. Si vide, le bot utilise
     // le pushName WhatsApp récupéré automatiquement à la connexion.
-    ownerName: "Daziano",
+    ownerName: "David",
 
     // Numéro du propriétaire affiché dans le message de connexion (sans +).
     // Peut être différent du numéro d'appairage (phoneNumber) si tu veux
@@ -77,11 +77,11 @@ module.exports = {
     sendWelcomeMessage: true, // Whether to send a message to yourself when the bot connects
 
     // ---------------------------------------------------------------
-    // Chatbot IA (porté depuis dazbot-1/Chat-Bot-Dazi)
+    // Chatbot IA (porté depuis david-1/Chat-Bot-Dav)
     // ---------------------------------------------------------------
     // Répond automatiquement aux messages privés texte via OpenRouter
     // (ou OpenAI) en imitant la personnalité définie dans personality.json.
-    // Désactivé par défaut : active avec `?dazai on`.
+    // Désactivé par défaut : active avec `?davai on`.
     aiAutoReply: false,
     // "gemini" (Google AI Studio, plan gratuit généreux) |
     // "openrouter" | "openai" | "mercury"
@@ -100,7 +100,7 @@ module.exports = {
     aiBlockedNumbers: [],
     // Numéros traités en MODE ROMANTIQUE ("copines") : le bot utilise la
     // personnalité `romantic` de personality.json (mots doux, ton affectueux,
-    // réassurance sur l'exclusivité) au lieu de la personnalité Daziano standard.
+    // réassurance sur l'exclusivité) au lieu de la personnalité dav standard.
     // Ex : ['22955724800', '22912345678']
     aiRomanticNumbers: []
 };

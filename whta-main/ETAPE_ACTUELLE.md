@@ -1,4 +1,4 @@
-# 📌 État Actuel du Projet - DAZBOT
+# 📌 État Actuel du Projet - david
 
 ## 📅 Date : 19 Avril 2026
 ## 🚀 Étape : Optimisation de la Visibilité Mobile et Multi-Listes
@@ -6,12 +6,12 @@
 ### ✅ Ce qui a été accompli :
 1. **Système Multi-Focus** : 
    - Passage d'un focus unique à une liste illimitée d'amis.
-   - Commande : `?dazonly add [num] [emoji]`.
+   - Commande : `?davonly add [num] [emoji]`.
    - Le bot peut désormais suivre plusieurs personnes avec des emojis différents pour chacune.
 
 2. **Liste Discrète (🕵️ Mode Espion)** :
    - Ajout d'une liste prioritaire pour regarder les statuts sans JAMAIS liker.
-   - Commande : `?dazdiscrete add [num]`.
+   - Commande : `?davdiscrete add [num]`.
    - Idéal pour rester invisible tout en vidant ses notifications.
 
 3. **Correction de la Visibilité Mobile** :
@@ -24,9 +24,9 @@
    - Mise à jour de la détection des identifiants WhatsApp (Support des LIDs).
 
 ### 🛠️ Commandes Clés à tester :
-- `?dazonly list` : Voir vos amis suivis.
-- `?dazdiscrete list` : Voir vos cibles discrètes.
-- `?dazreset` : Tout remettre par défaut (Like Global ON).
+- `?davonly list` : Voir vos amis suivis.
+- `?davdiscrete list` : Voir vos cibles discrètes.
+- `?davreset` : Tout remettre par défaut (Like Global ON).
 - `?ping` : Vérifier si le bot est réveillé.
 
 ### 🚩 Prochaines étapes :

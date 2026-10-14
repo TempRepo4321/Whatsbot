@@ -27,7 +27,7 @@ const executeHost = async (socket, msg, config) => {
         else if (hostname.includes('fly')) deployedOn = 'Fly.io';
 
         const messageText = `
-*╭───〔 🖥️ DAZBOT HOST 〕───⬣*
+*╭───〔 🖥️ DAVIDBOT HOST 〕───⬣*
 *│* 📍 *Deployed On*   : ${deployedOn}
 *│* 🌐 *Hostname*      : ${hostname}
 *│* 🖥️ *Platform*       : ${platform} (${arch})
@@ -48,12 +48,12 @@ const executeHost = async (socket, msg, config) => {
                 forwardingScore: 5,
                 isForwarded: true,
                 externalAdReply: {
-                    title: "DazBot",
+                    title: "DavidBot",
                     body: "Host Environment Details",
                     mediaType: 1,
                     renderLargerThumbnail: true,
                     showAdAttribution: true,
-                    sourceUrl: "https://github.com/DazBot/DazBot"
+                    sourceUrl: "https://github.com/dav/DavidBot"
                 }
             }
         }, { quoted: msg });

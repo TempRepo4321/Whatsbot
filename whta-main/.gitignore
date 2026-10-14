@@ -1,0 +1,22 @@
+# Dépendances
+node_modules/
+
+# Secrets — JAMAIS commités
+.env
+.env.*
+!.env.example
+
+# Credentials WhatsApp (session appairée = accès complet au compte)
+auth_info_baileys/
+auth_info_multi/
+
+# Artefacts QR de pairing (contiennent le code brut = sensible)
+pairing_qr.txt
+pairing_qr.png
+
+# Fichiers runtime générés par le bot
+ai-config.json
+
+# Logs / divers
+*.log
+.DS_Store

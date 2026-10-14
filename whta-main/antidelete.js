@@ -150,7 +150,7 @@ const reportRevocation = async (sock, deletedId) => {
 
             // Suggestion blacklist contextuelle : pour un groupe on propose le
             // JID du groupe, pour un statut / privé on propose le numéro du
-            // poster (copiable direct dans ?dazantionly add / ?dazblock …).
+            // poster (copiable direct dans ?davantionly add / ?davblock …).
             let blacklistHint;
             if (isGroup) {
                 blacklistHint = `│ 🧱 *Blacklist groupe:* \`${chatJid}\``;

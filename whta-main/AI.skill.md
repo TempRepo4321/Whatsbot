@@ -1,11 +1,11 @@
 ---
-description: Documentation du module IA et de l'API de configuration pour DazBot.
+description: Documentation du module IA et de l'API de configuration pour david.
 globs:
 - "**/*.js"
 - "**/*.md"
 ---
 
-# DazBot - Module IA et API de configuration
+# david - Module IA et API de configuration
 
 ## Objectif
 Ce document décrit les nouvelles capacités IA ajoutées au bot :
@@ -16,17 +16,17 @@ Ce document décrit les nouvelles capacités IA ajoutées au bot :
 
 ## Commandes IA disponibles
 
-- `?dazai on` : active l'auto-réponse IA
-- `?dazai off` : désactive l'auto-réponse IA
-- `?dazai model <nom>` : change le modèle IA utilisé
-  - exemple : `?dazai model openai/gpt-4o-mini`
-- `?dazai provider <nom>` : change le provider IA primaire
+- `?davai on` : active l'auto-réponse IA
+- `?davai off` : désactive l'auto-réponse IA
+- `?davai model <nom>` : change le modèle IA utilisé
+  - exemple : `?davai model openai/gpt-4o-mini`
+- `?davai provider <nom>` : change le provider IA primaire
   - providers valides : `gemini`, `groq`, `cerebras`, `openrouter`, `openai`, `haoduomi`
   - pour `haoduomi`, ajoute `API_KEY` dans `.env`
-- `?dazai reload` : recharge `personality.json` sur tous les providers
-- `?dazai stats` : affiche l'état IA actuel
-- `?dazai key set <provider> <clé>` : stocke une clé API dans `.env`
-- `?dazai key remove <provider>` : supprime la clé API du provider
+- `?davai reload` : recharge `personality.json` sur tous les providers
+- `?davai stats` : affiche l'état IA actuel
+- `?davai key set <provider> <clé>` : stocke une clé API dans `.env`
+- `?davai key remove <provider>` : supprime la clé API du provider
 
 ## Fichier de configuration IA runtime
 
@@ -37,7 +37,7 @@ Le bot charge maintenant un fichier facultatif `ai-config.json` à la racine :
 - `aiMaxContextMessages`
 - `aiRespondToGroups`
 
-Ce fichier est créé automatiquement lorsqu'une configuration IA est modifiée via l'API ou via `?dazai model` / `?dazai provider`.
+Ce fichier est créé automatiquement lorsqu'une configuration IA est modifiée via l'API ou via `?davai model` / `?davai provider`.
 
 ## Endpoints API IA
 
@@ -87,7 +87,7 @@ Recharge `personality.json` sur tous les providers du pool.
 - L'API attend des requêtes JSON.
 - Les changements appliqués via l'API sont persistés dans `ai-config.json`.
 - Le bot continue de respecter la clé API des providers dans `.env`.
-- La commande `?dazai model` fonctionne immédiatement et persiste le modèle.
+- La commande `?davai model` fonctionne immédiatement et persiste le modèle.
 - Pour le provider `haoduomi`, la variable d'environnement attendue est `API_KEY`.
 
 ## Prochaine étape

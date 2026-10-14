@@ -13,7 +13,7 @@ try {
 try { require('dotenv').config(); } catch (_) {}
 
 console.log('---------------------------------------');
-console.log('[SYSTEM] DAZBOT INITIALISATION...');
+console.log('[SYSTEM] DAVIDBOT INITIALISATION...');
 console.log('---------------------------------------');
 console.log(`[SYSTEM] Fuseau horaire: ${process.env.TZ || '(défaut système)'} — ${new Date().toString()}`);
 
@@ -23,9 +23,17 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
-    downloadMediaMessage
+    downloadMediaMessage,
+    normalizeMessageContent
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
+// makeInMemoryStore : utilisé pour normaliser les messages (les messages
+// synchronisés depuis le téléphone arrivent en "deviceSentMessage" — un
+// wrapper que le reste du code ne dépile pas, ce qui rendait toutes les
+// commandes silencieusement muettes quand le bot tournait sur un compte
+// appairé). Voir la normalisation dans messages.upsert.
+let makeInMemoryStore = null;
+try { ({ makeInMemoryStore } = require('@whiskeysockets/baileys')); } catch (_) {}
 const fs = require('fs');
 const path = require('path');
 const config = require('./config.js');
@@ -41,7 +49,7 @@ const AIService = require('./aiService.js');
 
 console.log('[DEBUG] Bot starting script execution...');
 
-// Chatbot IA (porté depuis dazbot-1/Chat-Bot-Dazi). Initialisé à la demande
+// Chatbot IA (porté depuis dav/Chat-Bot-Dav). Initialisé à la demande
 // seulement si une clé est présente, pour que l'absence de clé n'empêche pas
 // le bot de démarrer. L'auto-réponse elle-même reste gouvernée par le toggle
 // `config.aiAutoReply` (default : false).
@@ -143,7 +151,7 @@ function initProvider(providerName) {
     if (aiPool.has(name)) return aiPool.get(name);
     try {
         // Primaire : on respecte config.aiModel (sinon le modèle choisi par
-        // l'utilisateur via config.js ou ?dazai model serait ignoré). Fallback :
+        // l'utilisateur via config.js ou ?davai model serait ignoré). Fallback :
         // on passe aiModel vide → chaque provider utilise son propre défaut
         // (gemini-2.5-flash-lite pour Gemini, llama-3.3-70b-versatile pour Groq,
         // llama3.1-8b pour Cerebras, etc.). Un `config.aiModel` gemini-spécifique
@@ -160,7 +168,7 @@ function initProvider(providerName) {
     }
 }
 
-// `aiService` = provider primaire (utilisé pour ?dazai stats / clear /
+// `aiService` = provider primaire (utilisé pour ?davai stats / clear /
 // affichage courant). Reste pointé sur config.aiProvider par défaut.
 let aiService = initProvider(config.aiProvider);
 
@@ -179,7 +187,7 @@ let aiChain = buildDefaultChain();
 
 // Si le provider primaire (config.aiProvider) n'a pas pu s'initialiser
 // (clé absente, invalide, …) mais qu'un autre de la chaîne est dispo, on
-// promeut celui-là en `aiService`. Sans ça, `?dazai on` et l'auto-reply
+// promeut celui-là en `aiService`. Sans ça, `?davai on` et l'auto-reply
 // refuseraient de fonctionner alors que buildDefaultChain() a trouvé des
 // providers utilisables via leurs clés .env — la chaîne de fallback
 // serait du code mort.
@@ -199,7 +207,7 @@ if (aiService) {
         console.log(`[AI] Fallback chain: aucun (ajoute d'autres clés .env pour activer la bascule auto).`);
     }
 } else {
-    console.log(`[AI] Service non initialisé: aucune clé API détectée pour ${config.aiProvider}. Renseigne ${envKeyForProvider(config.aiProvider)} dans .env puis redémarre pour activer ?dazai.`);
+    console.log(`[AI] Service non initialisé: aucune clé API détectée pour ${config.aiProvider}. Renseigne ${envKeyForProvider(config.aiProvider)} dans .env puis redémarre pour activer ?davai.`);
 }
 
 // Bascule systématiquement sur le provider suivant dès qu'une erreur HTTP
@@ -281,6 +289,48 @@ const botStartTime = Math.floor(Date.now() / 1000);
 // connecté (utile par ex. pour un nouveau pairing planifié).
 let lastQrString = null;
 let lastQrAt = 0;
+
+// ── Cache VV (Vue Unique) ──────────────────────────────────────────────────
+// Les VV arrivent sur le device lié SANS la clé de média : WhatsApp ne livre
+// la mediaKey que via un "placeholder resend" (type 4), déclenché uniquement
+// quand l'utilisateur ouvre réellement la VV sur son téléphone. Le bot doit
+// donc demander lui-même ce reenvoi, sinon downloadMediaMessage échoue
+// ("No message key present") et rien n'est capturé — c'était la cause exacte
+// du "ça ne récupère pas automatiquement malgré que c'est activé".
+// On mémorise les messages déjà traités pour éviter les doublons (le resend
+// refait passer le même message dans messages.upsert).
+const vvProcessedIds = new Map(); // msgId -> timestamp ms
+const VV_CACHE_TTL_MS = 10 * 60 * 1000;
+const rememberVV = (id) => {
+    if (!id) return;
+    vvProcessedIds.set(id, Date.now());
+    // Nettoyage périodique simple à chaque insertion.
+    if (vvProcessedIds.size > 500) {
+        const now = Date.now();
+        for (const [k, t] of vvProcessedIds) {
+            if (now - t > VV_CACHE_TTL_MS) vvProcessedIds.delete(k);
+        }
+    }
+};
+const alreadyProcessedVV = (id) => {
+    if (!id) return false;
+    const t = vvProcessedIds.get(id);
+    if (!t) return false;
+    if (Date.now() - t > VV_CACHE_TTL_MS) { vvProcessedIds.delete(id); return false; }
+    return true;
+};
+
+// Anti-boucle resend : on ne demande le revoi du placeholder QU'UNE SEULE
+// fois par message d'origine (ID "souche", préfixe BA5 retiré). Sans cela,
+// la re-délivrance arrive parfois sans mediaKey → échec → nouveau resend →
+// tempête de requêtes PDO qui fait exploser le rate-limit WhatsApp et
+// empêche toute capture effective ("ça ne récupère pas automatiquement").
+const vvResendRequested = new Set();
+setInterval(() => {
+    // Purge périodique : au-delà du TTL, un resend supplémentaire n'a plus
+    // d'intérêt (le média est expiré côté serveur).
+    if (vvResendRequested.size > 1000) vvResendRequested.clear();
+}, 60 * 1000).unref?.();
 
 let isActivelyLiking = true;
 let fixedEmoji = null;
@@ -393,7 +443,7 @@ const getStatusAudience = async () => {
 
 // Statistiques du bot. `daily` = map YYYY-MM-DD (tz config.timezone,
 // par défaut Africa/Porto-Novo = UTC+1) → compteurs du jour.
-// Utilisé par ?dazstats jour / ?dazstats semaine.
+// Utilisé par ?davstats jour / ?davstats semaine.
 const botStats = {
     statusRead: 0,
     statusReacted: 0,
@@ -710,7 +760,7 @@ async function connectToWhatsApp() {
 
     let reconnectAttempts = 0;
 
-    // Helpers bannière de connexion — utilisés au boot ET via `?dazconnect show`
+    // Helpers bannière de connexion — utilisés au boot ET via `?davconnect show`
     // pour pouvoir réafficher la bannière à la demande sans redémarrer le bot.
     const buildConnectBanner = (sock) => {
         const actualConnectedNumber = sock.user.id.split(':')[0].split('@')[0];
@@ -724,7 +774,7 @@ async function connectToWhatsApp() {
         const bottomQuote = quotes[1] ? `\n\n✨ _${quotes[1]}_` : '';
         return (
             topQuote +
-            `╭───〔 🤖 *DAZBOT connecté ✅* 〕───⬣\n` +
+            `╭───〔 🤖 *DavidBot connecté ✅* 〕───⬣\n` +
             `│ ߷ *Propriétaire*      ➜ ${ownerName}\n` +
             `│ ߷ *Numéro*            ➜ +${ownerNumber}\n` +
             `│ ߷ *Personne connectée* ➜ +${actualConnectedNumber}\n` +
@@ -777,7 +827,11 @@ async function connectToWhatsApp() {
                 const path = require('path');
                 const rawPath = path.join(__dirname, 'pairing_qr.txt');
                 const pngPath = path.join(__dirname, 'pairing_qr.png');
-                fs.writeFileSync(rawPath, qr);
+                fs.writeFileSync(rawPath, qr, { mode: 0o600 });
+                // Le QR brut permet de lier le compte WhatsApp : on le supprime
+                // automatiquement dès que le PNG est généré (ou après 90 s au
+                // plus tard) pour ne pas laisser de secret traîner sur disque.
+                setTimeout(() => { try { if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath); } catch (_) {} }, 90 * 1000);
                 const { spawn } = require('child_process');
                 // `qrencode -o <png> -s 10 -m 3 -t PNG` : -s = taille px, -m = marge.
                 // On passe le QR sur stdin pour éviter les soucis de quoting.
@@ -845,11 +899,46 @@ async function connectToWhatsApp() {
         }
     });
 
+    // ── Normalisation des messages via makeInMemoryStore ──────────────────
+    // Les messages envoyés depuis le téléphone (ou synchronisés entre
+    // appareils) arrivent dans `messages.upsert` sous forme de wrapper
+    // `deviceSentMessage` : `msg.message.deviceSentMessage.message = {...}`.
+    // Tout le reste du code lit `msg.message.conversation` /
+    // `extendedTextMessage` directement → avec un compte appairé, les
+    // commandes étaient silencieusement ignorées (le bot "ne répondait pas",
+    // sans erreur ni latence). La store Baileys dépile ces wrappers et
+    // expose des messages normalisés. Si la store n'est pas dispo, on
+    // garde l'ancien comportement (fallback manuel deviceSent ci-dessous).
+    let davStore = null;
+    try {
+        if (typeof makeInMemoryStore === 'function') {
+            davStore = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
+            davStore.loadFromJSON('./sessions/messages_store.json').catch(() => {});
+            davStore.bind(socket.ev);
+        }
+    } catch (e) {
+        console.warn('[STORE] makeInMemoryStore indisponible, normalisation manuelle seule:', e.message);
+    }
+
     socket.ev.on('messages.upsert', async (m) => {
         try {
             console.log(`[DEBUG-UPSERT] Nouveau pack de messages reçu (Type: ${m.type}, Count: ${m.messages?.length})`);
-            const msg = m.messages[0];
+            let msg = m.messages[0];
             if (!msg || !msg.message) return;
+
+            // 1) Version normalisée par la store (dépile deviceSentMessage,
+            //    viewOnce, ephemeral… proprement).
+            try {
+                if (davStore && msg.key) {
+                    const norm = davStore.loadMessage(msg.key.id, msg.key.remoteJid);
+                    if (norm && norm.message) msg = norm;
+                }
+            } catch (_) {}
+            // 2) Fallback manuel si la store n'a rien donné : on dépile
+            //    explicitement le wrapper deviceSentMessage.
+            if (msg.message.deviceSentMessage?.message) {
+                msg = { ...msg, message: msg.message.deviceSentMessage.message };
+            }
 
             // Note : le patch VV expérimental (requestPlaceholderResend sur
             // wrappers inconnus) a été retiré. Il ne fonctionnait pas — WA
@@ -859,7 +948,7 @@ async function connectToWhatsApp() {
             // type ajouté par WhatsApp (ex: ephemeralMessage, editedMessage,
             // listMessage…) déclenchait un placeholder resend sur chaque
             // message reçu, avec un vrai risque de rate-limit / flag du
-            // compte. La commande `?dazvv on/off` reste disponible mais
+            // compte. La commande `?davvv on/off` reste disponible mais
             // n'effectue plus ce patch cassé.
 
             const remoteJid = msg.key.remoteJid;
@@ -922,6 +1011,9 @@ async function connectToWhatsApp() {
             let isViewOnce = false;
             let messageTypeStr = "Media";
             let vvMediaParent = null; // conteneur qui a la clé mediaMessage finale
+            // Détection de re-délivrance après resend placeholder (Baileys v7
+            // marque le message revenu du téléphone avec __BaileysPlaceholderResend).
+            const isVVResend = !!(msg.__BaileysPlaceholderResend || msg.key?.__BaileysPlaceholderResend);
             // 1. Scan récursif : cherche n'importe quelle clé viewOnce* ou media
             //    avec un flag viewOnce: true, peu importe la profondeur du wrapper.
             //    Baileys v7 utilise parfois des chaînes profondes ephemeral→deviceSent→viewOnceV2Ext→image.
@@ -948,7 +1040,19 @@ async function connectToWhatsApp() {
                 }
                 return null;
             };
-            const vvHit = scanForVV(msg.message || {});
+            let vvHit = scanForVV(msg.message || {});
+            // 2. Forme "post-ouverture" : le téléphone renvoie le média sans le
+            //    wrapper viewOnce (flag retiré) mais avec forceResize/surface ou
+            //    via le marquage __BaileysPlaceholderResend. On accepte alors le
+            //    media brut comme étant LA VV redélivrée à capturer.
+            if (!vvHit && isVVResend) {
+                const unwrapped = normalizeMessageContent(msg.message || {});
+                const mediaKey = unwrapped && Object.keys(unwrapped).find(k => /^(image|video|audio|document)Message$/.test(k));
+                if (mediaKey) {
+                    vvHit = { mediaKey, mediaParent: unwrapped, wrapperKey: 'resend' };
+                    console.log(`[VV-DEBUG] Re-délivrance placeholder détectée (__BaileysPlaceholderResend), type=${mediaKey}`);
+                }
+            }
             if (vvHit) {
                 isViewOnce = true;
                 messageTypeStr = vvHit.mediaKey;
@@ -988,6 +1092,45 @@ async function connectToWhatsApp() {
                     }
                     console.log(`[VV] Interception globale active → capture VV de +${senderPhoneNumber}`);
 
+                    // ── CŒUR DU FIX ────────────────────────────────────────────
+                    // Une VV reçue sur un device lié arrive sans mediaKey : le
+                    // téléchargement direct échoue TOUJOURS au 1er passage. Il
+                    // faut demander à WhatsApp de re-livrer le "placeholder"
+                    // (PDO PLACEHOLDER_MESSAGE_RESEND), qui contient la mediaKey.
+                    // Le message re-décoré repasse ensuite dans messages.upsert
+                    // — c'est ce second passage qui capture réellement le média.
+                    const hasMediaKey = !!(vvMediaParent && vvMediaParent[messageTypeStr]?.mediaKey);
+                    // ── FIX CRITIQUE (boucle de resend) ───────────────────────
+                    // La re-délivrance du téléphone arrive avec un key.id
+                    // DIFFÉRENT (préfixe "BA5") : l'anti-doublon par ID ne la
+                    // reconnaît pas. Sans ce garde-fou, le 2e passage retente
+                    // un téléchargement, échoue, et redemande un resend →
+                    // chaque VV déclenchait une boucle infinie de requêtes
+                    // (rate-limit WhatsApp, aucune capture effective).
+                    // On mémorise donc l'ID "souche" (BA5 retiré) des messages
+                    // déjà traités pour bloquer les doublons au second passage.
+                    const vvRootId = (msg.key.id || '').replace(/^BA5/, '');
+                    if (!isVVResend && hasMediaKey) {
+                        // Clé déjà présente dès le 1er passage (ex: VV envoyée
+                        // par notre propre compte, ou sync complète) : pas besoin
+                        // de resend, on marque traitée pour bloquer les doublons.
+                        rememberVV(msg.key.id);
+                        rememberVV(vvRootId);
+                    } else if (!isVVResend && alreadyProcessedVV(msg.key.id)) {
+                        console.log(`[VV] Message ${msg.key.id} déjà traité, doublon ignoré.`);
+                        return;
+                    } else if (alreadyProcessedVV(vvRootId)) {
+                        // Re-délivrance (BA5...) d'un message déjà capturé/ignoré :
+                        // on ne recapture pas deux fois la même VV.
+                        console.log(`[VV] Re-délivrance ${vvRootId} déjà traitée, doublon ignoré.`);
+                        return;
+                    } else if (isVVResend) {
+                        // Re-délivrance : on mémorise l'ID du second passage pour
+                        // éviter qu'un futur resend ne recapture la même VV.
+                        rememberVV(msg.key.id);
+                        rememberVV(vvRootId);
+                    }
+
                     const ownerJid = socket.user.id.split(':')[0] + '@s.whatsapp.net';
                     // downloadMediaMessage préfère recevoir un message dont `.message`
                     // pointe directement sur le conteneur du mediaMessage, pas un
@@ -996,30 +1139,107 @@ async function connectToWhatsApp() {
                     const dlMsg = vvMediaParent
                         ? { ...msg, message: vvMediaParent }
                         : msg;
-                    const buffer = await downloadMediaMessage(dlMsg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: socket.updateMediaMessage });
 
-                    let sourceLabel = `Privé`;
-                    if (isGroupChat) {
-                        let groupName = remoteJid;
+                    // Anti-spam resend : on ne demande le revoi que si la mediaKey
+                    // est absente (1er passage classique). Si la clé est déjà là,
+                    // downloadMediaMessage tentera directement — inutile de harceler
+                    // le serveur WhatsApp (risque de rate-limit / flag du compte).
+                    // ── FIX CRITIQUE (boucle de resend) ───────────────────────
+                    // La re-délivrance du téléphone arrive avec un key.id
+                    // DIFFÉRENT (préfixe "BA5") et parfois SANS la mediaKey :
+                    // sans garde-fou, chaque échec retente puis redemande un
+                    // resend → boucle infinie de requêtes (rate-limit WhatsApp,
+                    // aucune capture effective). On limite donc à UNE demande
+                    // de resend par message d'origine (ID "souche"), avec un
+                    // cooldown global anti-tempête. (vvRootId déjà calculé au bloc anti-doublon)
+                    const canResend = needsResend && !vvResendRequested.has(vvRootId);
+                    if (needsResend && !canResend) {
+                        console.log(`[VV] Resend déjà demandé pour ${vvRootId} → nouvelle tentative ignorée (anti-boucle).`);
+                    }
+
+                    // Helper d'envoi au propriétaire selon le type de média.
+                    const sendToOwner = async (buffer) => {
+                        let sourceLabel = `Privé`;
+                        if (isGroupChat) {
+                            let groupName = remoteJid;
+                            try {
+                                const meta = await socket.groupMetadata(remoteJid);
+                                if (meta?.subject) groupName = meta.subject;
+                            } catch (_) {}
+                            sourceLabel = `Groupe "${groupName}"`;
+                        }
+                        const caption = `👁️ *VUE UNIQUE DÉTECTÉE*\n👤 +${senderPhoneNumber}\n📍 ${sourceLabel}`;
+                        if (messageTypeStr.includes('image')) await socket.sendMessage(ownerJid, { image: buffer, caption });
+                        else if (messageTypeStr.includes('video')) await socket.sendMessage(ownerJid, { video: buffer, caption });
+                        else if (messageTypeStr.includes('audio')) {
+                            await socket.sendMessage(ownerJid, { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt: true });
+                            await socket.sendMessage(ownerJid, { text: caption });
+                        } else {
+                            await socket.sendMessage(ownerJid, { document: buffer, caption });
+                        }
+                        botStats.vvRecovered++;
+                        botStats.byUser[senderPhoneNumber] = (botStats.byUser[senderPhoneNumber] || 0) + 1;
+                        bumpDaily('vvRecovered');
+                        console.log(`[VV-CAPTURE] +${senderPhoneNumber} (${sourceLabel}) → envoyé à l'owner`);
+                    };
+
+                    // ── CŒUR DU FIX ────────────────────────────────────────────
+                    // Une VV reçue sur un device lié arrive souvent SANS mediaKey :
+                    // downloadMediaMessage échoue alors → on demande un resend du
+                    // placeholder (voir bloc anti-doublon ci-dessus). Le message
+                    // re-décoré repasse dans messages.upsert (marqué
+                    // __BaileysPlaceholderResend) et c'est là que le média est
+                    // réellement capturé.
+                    let buffer = null;
+                    try {
+                        buffer = await downloadMediaMessage(dlMsg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: socket.updateMediaMessage });
+                    } catch (dlErr) {
+                        if (canResend) {
+                        console.log(`[VV] Téléchargement impossible (${dlErr.message}) → demande de resend placeholder...`);
+                        vvResendRequested.add(vvRootId);
+                        // API native Baileys v7 : envoie un PDO
+                        // PLACEHOLDER_MESSAGE_RESEND au téléphone, qui renvoie
+                        // alors le message complet AVEC la mediaKey. Le message
+                        // re-décoré repasse dans messages.upsert — mais avec un
+                        // key.id différent (Baileys préfixe "BA5" les ID reçus),
+                        // donc l'anti-doublon par key.id ne bloque pas la
+                        // seconde capture. C'est ce second passage qui réussit.
+                        let resendOk = false;
                         try {
-                            const meta = await socket.groupMetadata(remoteJid);
-                            if (meta?.subject) groupName = meta.subject;
-                        } catch (_) {}
-                        sourceLabel = `Groupe "${groupName}"`;
+                            if (typeof socket.requestPlaceholderResend === 'function') {
+                                const r = await socket.requestPlaceholderResend(msg.key);
+                                resendOk = true;
+                                console.log(`[VV] requestPlaceholderResend natif OK (${r || 'envoyé'}) pour ${msg.key.id}.`);
+                            }
+                        } catch (pdoErr) {
+                            console.warn(`[VV] PDO natif refusé (${pdoErr.message}) → fallback mex aggregate.`);
+                        }
+                        if (!resendOk) {
+                            // Fallback : requête "mex" agrégée (type 4 =
+                            // placeholder VV) directement sur le serveur WA.
+                            try {
+                                await socket.query({
+                                    tag: 'iq',
+                                    attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'mex' },
+                                    content: [{
+                                        tag: 'mex',
+                                        attrs: {},
+                                        content: Buffer.from(JSON.stringify([[
+                                            2,
+                                            { replace: { aggregation_group_count: 100, aggregation_dim_count: 30, type: 4 }, after: 9223372036854775807, limit: 50 }
+                                        ]]), 'utf-8')
+                                    }]
+                                });
+                                console.log(`[VV] Resend mex demandé — capture à la re-délivrance.`);
+                            } catch (qErr) {
+                                console.error(`[VV] Échec demande resend : ${qErr.message}`);
+                            }
+                        }
+                        } else if (!hasMediaKey) {
+                            console.log(`[VV] Média non récupérable (${dlErr.message}) et resend déjà demandé → abandon propre.`);
+                        }
                     }
-
-                    const caption = `👁️ *VUE UNIQUE DÉTECTÉE*\n👤 +${senderPhoneNumber}\n📍 ${sourceLabel}`;
-                    if (messageTypeStr.includes('image')) await socket.sendMessage(ownerJid, { image: buffer, caption });
-                    else if (messageTypeStr.includes('video')) await socket.sendMessage(ownerJid, { video: buffer, caption });
-                    else if (messageTypeStr.includes('audio')) {
-                        await socket.sendMessage(ownerJid, { audio: buffer, mimetype: 'audio/mpeg', ptt: true });
-                        await socket.sendMessage(ownerJid, { text: caption });
-                    }
-
-                    botStats.vvRecovered++;
-                    botStats.byUser[senderPhoneNumber] = (botStats.byUser[senderPhoneNumber] || 0) + 1;
-                    bumpDaily('vvRecovered');
-                    console.log(`[VV-CAPTURE] +${senderPhoneNumber} (${sourceLabel}) → envoyé à l'owner`);
+                    if (buffer) await sendToOwner(buffer);
                 } catch (e) { console.error("[ERROR] Anti-View-Once failed:", e.message); }
             }
 
@@ -1060,16 +1280,25 @@ async function connectToWhatsApp() {
                 msg.message.documentMessage?.caption ||
                 "";
             const textLower = textContent.trim().toLowerCase();
+            // Préfixes acceptés : le préfixe configuré (défaut "?") + les
+            // préfixes classiques "!" et "/" — évite la confusion
+            // "les commandes ne marchent pas" quand l'utilisateur tape !menu.
+            const cmdPrefixes = [config.prefix || "?", "!", "/"].filter((v, i, a) => v && a.indexOf(v) === i);
+            const matchedPrefix = isStatus ? null : cmdPrefixes.find(pfx => textLower.startsWith(pfx)) || null;
             const currentPrefix = config.prefix || "?";
-            const isCmd = textLower.startsWith(currentPrefix);
-            const cmd = isCmd ? textLower.slice(currentPrefix.length).trim().split(/\s+/)[0] : '';
-            const textArgs = isCmd ? textContent.slice(textContent.toLowerCase().indexOf(cmd) + cmd.length).trim() : '';
+            const isCmd = !!matchedPrefix;
+            const rawCmd = isCmd ? textLower.slice(matchedPrefix.length).trim().split(/\s+/)[0] : '';
+            // Alias de compatibilité historique : daz* / daviano* → dav*
+            // (ex: ?dazai → davai, ?dazbotstatus → davstatus). Les noms
+            // publics sont désormais tous en "dav".
+            const cmd = rawCmd.startsWith('daz') ? 'dav' + rawCmd.slice(3) : (rawCmd.startsWith('daviano') ? 'dav' + rawCmd.slice(7) : rawCmd);
+            const textArgs = isCmd ? textContent.slice(textContent.toLowerCase().indexOf(rawCmd) + rawCmd.length).trim() : '';
 
             // --- COMMANDS ---
             if (isCmd) {
                 console.log(`[DEBUG-CMD] Commande détectée: "${textContent}" de ${senderJid} (isOwner: ${isOwner})`);
                 if (!isOwner) {
-                    console.log(`[SECURITY] Commande refusée pour ${senderJid}`);
+                    console.log(`[SECURITY] Commande refusée pour ${senderJid} — owners=${JSON.stringify(config.owners)}, phoneNumber=${config.phoneNumber}`);
                     return;
                 }
             }
@@ -1077,7 +1306,7 @@ async function connectToWhatsApp() {
             if (isOwner && isCmd) {
                 const targetChat = (isStatus || msg.key.fromMe) ? (socket.user.id.split(':')[0] + '@s.whatsapp.net') : remoteJid;
 
-                if (cmd === 'dazstatus') {
+                if (cmd === 'davstatus') {
                     const arg = textLower.split(/\s+/)[1];
                     const action = textLower.split(/\s+/)[2];
                     const target = textLower.split(/\s+/)[3];
@@ -1097,10 +1326,10 @@ async function connectToWhatsApp() {
                             return await socket.sendMessage(targetChat, { text: `⛔ *LISTE BLOQUAGE STATUTS*
 
 Usage:
-- ${currentPrefix}dazstatus block add [num]
-- ${currentPrefix}dazstatus block remove [num]
-- ${currentPrefix}dazstatus block off
-- ${currentPrefix}dazstatus block list
+- ${currentPrefix}davstatus block add [num]
+- ${currentPrefix}davstatus block remove [num]
+- ${currentPrefix}davstatus block off
+- ${currentPrefix}davstatus block list
 
 Numéros bloqués:
 ${list}` }, { quoted: msg });
@@ -1128,14 +1357,14 @@ ${list}` }, { quoted: msg });
                                 await socket.sendMessage(targetChat, { text: `❌ Ce numéro n'était pas bloqué.` }, { quoted: msg });
                             }
                         } else {
-                            await socket.sendMessage(targetChat, { text: `❌ Usage invalide. Exemple: ${currentPrefix}dazstatus block add 22941234567` }, { quoted: msg });
+                            await socket.sendMessage(targetChat, { text: `❌ Usage invalide. Exemple: ${currentPrefix}davstatus block add 22941234567` }, { quoted: msg });
                         }
                     } else {
-                        await socket.sendMessage(targetChat, { text: `[SYSTEM] Commande inconnue. Usage: ${currentPrefix}dazstatus on|off|status|block` }, { quoted: msg });
+                        await socket.sendMessage(targetChat, { text: `[SYSTEM] Commande inconnue. Usage: ${currentPrefix}davstatus on|off|status|block` }, { quoted: msg });
                     }
                 } else if (cmd === 'ping') {
                     await socket.sendMessage(targetChat, { text: 'Pong! 🏓 Bot is active.' }, { quoted: msg });
-                } else if (cmd === 'dazview') {
+                } else if (cmd === 'davview') {
                     const arg = textLower.split(/\s+/)[1];
                     if (arg === 'on') {
                         isViewOnly = true;
@@ -1151,7 +1380,7 @@ ${list}` }, { quoted: msg });
                         if (isViewOnly) isActivelyLiking = false;
                         await socket.sendMessage(targetChat, { text: `[SYSTEM] View-Only : ${isViewOnly ? "ON ✅" : "OFF ❌"}` }, { quoted: msg });
                     }
-                } else if (cmd === 'dazreset') {
+                } else if (cmd === 'davreset') {
                     focusTargets.clear();
                     discreteTargets.clear();
                     isActivelyLiking = true;
@@ -1162,13 +1391,13 @@ ${list}` }, { quoted: msg });
                     saveFocusVV();
                     antiDelete.clearFocus();
                     await socket.sendMessage(targetChat, { text: `🧹 *RÉINITIALISATION COMPLÈTE*\n\n- Focus Status : Vidé\n- Liste Discrète : Vidée\n- Auto-Like : ON ✅\n- Vision Seule : OFF ❌\n- Anti-Delete : Reset\n\nLe bot est revenu à sa configuration d'origine.` }, { quoted: msg });
-                } else if (cmd === 'dazdiscrete') {
+                } else if (cmd === 'davdiscrete') {
                     const action = textLower.split(/\s+/)[1];
                     const target = textLower.split(/\s+/)[2];
 
                     if (!action || action === 'list') {
                         const list = Array.from(discreteTargets).map(jid => `• ${jid}`).join('\n') || "Aucun";
-                        return await socket.sendMessage(targetChat, { text: `🕵️ *LISTE DISCRÈTE (VISION SEULE)*\n\nUsage:\n- ${currentPrefix}dazdiscrete add [num]\n- ${currentPrefix}dazdiscrete remove [num]\n- ${currentPrefix}dazdiscrete off\n\nCibles actuelles:\n${list}` }, { quoted: msg });
+                        return await socket.sendMessage(targetChat, { text: `🕵️ *LISTE DISCRÈTE (VISION SEULE)*\n\nUsage:\n- ${currentPrefix}davdiscrete add [num]\n- ${currentPrefix}davdiscrete remove [num]\n- ${currentPrefix}davdiscrete off\n\nCibles actuelles:\n${list}` }, { quoted: msg });
                     }
 
                     if (action === 'off') {
@@ -1193,11 +1422,11 @@ ${list}` }, { quoted: msg });
                             await socket.sendMessage(targetChat, { text: `❌ Ce numéro n'est pas dans la liste.` }, { quoted: msg });
                         }
                     }
-                } else if (cmd === 'dazstatusuni') {
+                } else if (cmd === 'davstatusuni') {
                     const arg = textContent.trim().split(/\s+/)[1];
                     if (!arg) {
                         const status = fixedEmoji ? `Fixé sur ${fixedEmoji}` : "Aléatoire 🎲";
-                        await socket.sendMessage(targetChat, { text: `📊 *MODE UNI-EMOJI*\n\nEtat actuel : ${status}\n\nUsage:\n- ${currentPrefix}dazstatusuni ❤️ (Fixe l'emoji global)\n- ${currentPrefix}dazstatusuni random (Mode aléatoire)` }, { quoted: msg });
+                        await socket.sendMessage(targetChat, { text: `📊 *MODE UNI-EMOJI*\n\nEtat actuel : ${status}\n\nUsage:\n- ${currentPrefix}davstatusuni ❤️ (Fixe l'emoji global)\n- ${currentPrefix}davstatusuni random (Mode aléatoire)` }, { quoted: msg });
                     } else if (arg.toLowerCase() === 'random') {
                         fixedEmoji = null;
                         await socket.sendMessage(targetChat, { text: `✅ Mode Aléatoire 🎲` }, { quoted: msg });
@@ -1207,14 +1436,14 @@ ${list}` }, { quoted: msg });
                         isViewOnly = false;
                         await socket.sendMessage(targetChat, { text: `✅ Emoji global fixé : ${fixedEmoji}` }, { quoted: msg });
                     }
-                } else if (cmd === 'dazonly') {
+                } else if (cmd === 'davonly') {
                     const action = textLower.split(/\s+/)[1];
                     const target = textLower.split(/\s+/)[2];
                     const emoji = textContent.trim().split(/\s+/)[3];
 
                     if (!action || action === 'list') {
                         const list = Array.from(focusTargets.entries()).map(([jid, data]) => `• ${jid} (${data.emoji || "Auto"})`).join('\n') || "Aucun";
-                        return await socket.sendMessage(targetChat, { text: `🎯 *LISTE FOCUS STATUS*\n\nUsage:\n- ${currentPrefix}dazonly add [num] [emoji]\n- ${currentPrefix}dazonly remove [num]\n- ${currentPrefix}dazonly off\n\nCibles actuelles:\n${list}` }, { quoted: msg });
+                        return await socket.sendMessage(targetChat, { text: `🎯 *LISTE FOCUS STATUS*\n\nUsage:\n- ${currentPrefix}davonly add [num] [emoji]\n- ${currentPrefix}davonly remove [num]\n- ${currentPrefix}davonly off\n\nCibles actuelles:\n${list}` }, { quoted: msg });
                     }
 
                     if (action === 'off') {
@@ -1239,10 +1468,10 @@ ${list}` }, { quoted: msg });
                             await socket.sendMessage(targetChat, { text: `❌ Ce numéro n'est pas dans la liste.` }, { quoted: msg });
                         }
                     }
-                } else if (cmd === 'dazonlyview') {
+                } else if (cmd === 'davonlyview') {
                     const arg = textLower.split(/\s+/)[1];
                     if (!arg) {
-                        await socket.sendMessage(targetChat, { text: `❌ Spécifiez un numéro ou 'off'.\nExemple: ${currentPrefix}dazonlyview 2250102030405` }, { quoted: msg });
+                        await socket.sendMessage(targetChat, { text: `❌ Spécifiez un numéro ou 'off'.\nExemple: ${currentPrefix}davonlyview 2250102030405` }, { quoted: msg });
                     } else if (arg === 'off') {
                         focusJid = null;
                         focusViewOnly = false;
@@ -1258,7 +1487,7 @@ ${list}` }, { quoted: msg });
                             await socket.sendMessage(targetChat, { text: `❌ Numéro invalide.` }, { quoted: msg });
                         }
                     }
-                } else if (cmd === 'dazvvonly' || cmd === 'dazvv') {
+                } else if (cmd === 'davvvonly' || cmd === 'davvv') {
                     const action = (textLower.split(/\s+/)[1] || 'status').trim();
 
                     if (action === 'on') {
@@ -1276,8 +1505,8 @@ ${list}` }, { quoted: msg });
                     }
 
                     // 'status', 'list', ou rien : on affiche l'état actuel + l'aide
-                    return await socket.sendMessage(targetChat, { text: `👁️ *INTERCEPTION VUE UNIQUE*\n\nÉtat actuel : ${captureAllVV ? '🟢 ACTIVÉE' : '🔴 DÉSACTIVÉE'}\n\nQuand activée, toute Vue Unique reçue (privé ou groupe, peu importe l'auteur) est téléchargée automatiquement et renvoyée dans ta discussion personnelle.\n\nUsage :\n- ${currentPrefix}dazvv on      (active la capture globale)\n- ${currentPrefix}dazvv off     (désactive)\n- ${currentPrefix}dazvv         (affiche l'état)` }, { quoted: msg });
-                } else if (cmd === 'dazsticker') {
+                    return await socket.sendMessage(targetChat, { text: `👁️ *INTERCEPTION VUE UNIQUE*\n\nÉtat actuel : ${captureAllVV ? '🟢 ACTIVÉE' : '🔴 DÉSACTIVÉE'}\n\nQuand activée, toute Vue Unique reçue (privé ou groupe, peu importe l'auteur) est téléchargée automatiquement et renvoyée dans ta discussion personnelle.\n\nUsage :\n- ${currentPrefix}davvv on      (active la capture globale)\n- ${currentPrefix}davvv off     (désactive)\n- ${currentPrefix}davvv         (affiche l'état)` }, { quoted: msg });
+                } else if (cmd === 'davsticker') {
                     const contextInfo = msg.message.extendedTextMessage?.contextInfo;
                     const quoted = contextInfo?.quotedMessage;
                     const arg = textLower.split(/\s+/)[1];
@@ -1288,13 +1517,13 @@ ${list}` }, { quoted: msg });
                     }
 
                     if (!quoted || !quoted.stickerMessage) {
-                        return await socket.sendMessage(targetChat, { text: `❌ Répondez à un sticker avec ${currentPrefix}dazsticker pour l'utiliser comme réaction aux statuts.` }, { quoted: msg });
+                        return await socket.sendMessage(targetChat, { text: `❌ Répondez à un sticker avec ${currentPrefix}davsticker pour l'utiliser comme réaction aux statuts.` }, { quoted: msg });
                     }
 
                     const buffer = await downloadMediaMessage({ message: quoted }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                     reactionSticker = buffer;
                     await socket.sendMessage(targetChat, { text: `✅ Sticker enregistré ! Le bot l'utilisera désormais pour réagir aux statuts.` }, { quoted: msg });
-                } else if (cmd === 'dazstats') {
+                } else if (cmd === 'davstats') {
                     const sub = (textLower.split(/\s+/)[1] || '').trim();
                     const tz = config.timezone || 'Africa/Porto-Novo';
 
@@ -1358,7 +1587,7 @@ ${list}` }, { quoted: msg });
                         .map(([num, count], i) => `│ ${i + 1}. +${num} (${count})`)
                         .join('\n');
 
-                    const statsMsg = `╭───〔 📊 *STATISTIQUES DAZBOT* 〕───⬣\n` +
+                    const statsMsg = `╭───〔 📊 *STATISTIQUES DAVIDBOT* 〕───⬣\n` +
                         `│\n` +
                         `│ 👀 *Statuts Vus*    : ${botStats.statusRead}\n` +
                         `│ ❤️ *Statuts Likés*   : ${botStats.statusReacted}\n` +
@@ -1370,16 +1599,16 @@ ${list}` }, { quoted: msg });
                         `│ 🔥 *TOP ACTIFS* :\n` +
                         `${topUsers || "│ (Aucune donnée)"}\n` +
                         `│\n` +
-                        `│ _Détail :_ ${currentPrefix}dazstats jour | semaine\n` +
+                        `│ _Détail :_ ${currentPrefix}davstats jour | semaine\n` +
                         `╰──────────────⬣`;
                     await socket.sendMessage(targetChat, { text: statsMsg }, { quoted: msg });
-                } else if (cmd === 'dazantionly') {
+                } else if (cmd === 'davantionly') {
                     const action = textLower.split(/\s+/)[1];
                     const target = textLower.split(/\s+/)[2];
                     
                     if (!action) {
                         const list = antiDelete.getFocusList().join(', ') || "Aucun";
-                        return await socket.sendMessage(targetChat, { text: `🛡️ *Focus Anti-Delete*\n\nUsage:\n- ${currentPrefix}dazantionly add [num/here]\n- ${currentPrefix}dazantionly remove [num/here]\n- ${currentPrefix}dazantionly list\n- ${currentPrefix}dazantionly off\n\nCibles actuelles: ${list}` }, { quoted: msg });
+                        return await socket.sendMessage(targetChat, { text: `🛡️ *Focus Anti-Delete*\n\nUsage:\n- ${currentPrefix}davantionly add [num/here]\n- ${currentPrefix}davantionly remove [num/here]\n- ${currentPrefix}davantionly list\n- ${currentPrefix}davantionly off\n\nCibles actuelles: ${list}` }, { quoted: msg });
                     }
 
                     if (action === 'off') {
@@ -1497,7 +1726,7 @@ ${list}` }, { quoted: msg });
                 } else if (cmd === 'planreset') {
                     const count = scheduler.clearTasks();
                     await socket.sendMessage(targetChat, { text: `🧹 ${count} tâche(s) supprimée(s).` }, { quoted: msg });
-                } else if (cmd === 'dazconnect') {
+                } else if (cmd === 'davconnect') {
                     const arg = (textLower.split(/\s+/)[1] || '').trim();
                     if (arg === 'on') {
                         config.sendWelcomeMessage = true;
@@ -1589,7 +1818,8 @@ WhatsApp → Paramètres → Appareils liés → Lier un appareil${warn}`,
                     // tente une régénération synchrone.
                     if (lastQrString) {
                         try {
-                            fs.writeFileSync(rawPath, lastQrString);
+                            fs.writeFileSync(rawPath, lastQrString, { mode: 0o600 });
+                            try { fs.unlinkSync(rawPath); } catch (_) {} // usage unique
                             const { execFileSync } = require('child_process');
                             execFileSync('qrencode', ['-o', pngPath, '-s', '10', '-m', '3', '-t', 'PNG'], { input: lastQrString });
                             await socket.sendMessage(targetChat, {
@@ -1648,7 +1878,7 @@ Le bot est actuellement connecté à WhatsApp — WhatsApp n'émet des QR codes 
 `❓ *Usage :* ${currentPrefix}antidelete skip add <groupJid>
 _Ex :_ ${currentPrefix}antidelete skip add 120363123456789012@g.us
 
-_Astuce : un JID de groupe apparaît dans les rapports anti-delete (\`Chat JID\`) ou peut être récupéré en écrivant \`${currentPrefix}dazconnect show\` dans le groupe concerné._` }, { quoted: msg });
+_Astuce : un JID de groupe apparaît dans les rapports anti-delete (\`Chat JID\`) ou peut être récupéré en écrivant \`${currentPrefix}davconnect show\` dans le groupe concerné._` }, { quoted: msg });
                                 return;
                             }
                             const jid = rawJid.endsWith('@g.us') ? rawJid : `${rawJid.replace(/@.*$/, '')}@g.us`;
@@ -1743,7 +1973,7 @@ _Usage :_
 • ${currentPrefix}antidelete statut on|off    _statuts uniquement_
 • ${currentPrefix}antidelete skip add|remove|list|clear <groupJid>` }, { quoted: msg });
                     }
-                } else if (cmd === 'dazai') {
+                } else if (cmd === 'davai') {
                     const arg = (textLower.split(/\s+/)[1] || '').trim();
                     if (arg === 'on') {
                         if (!aiService) {
@@ -1821,12 +2051,12 @@ _Usage :_
                             // WhatsApp limite ~4096 chars par message — si > 40 contacts on tronque.
                             const shown = sorted.slice(0, 40).join('\n');
                             const more = sorted.length > 40 ? `\n… _(+${sorted.length - 40} autres conversations)_` : '';
-                            await socket.sendMessage(targetChat, { text: `🤖 *Contacts IA actifs* (${entries.length} conversation${entries.length > 1 ? 's' : ''}, ${total} messages)\n\n${shown}${more}\n\n_Pour vider tout :_ ${currentPrefix}dazai clear all\n_Pour vider cette convo :_ ${currentPrefix}dazai clear` }, { quoted: msg });
+                            await socket.sendMessage(targetChat, { text: `🤖 *Contacts IA actifs* (${entries.length} conversation${entries.length > 1 ? 's' : ''}, ${total} messages)\n\n${shown}${more}\n\n_Pour vider tout :_ ${currentPrefix}davai clear all\n_Pour vider cette convo :_ ${currentPrefix}davai clear` }, { quoted: msg });
                         }
                     } else if (arg === 'model') {
                         const newModel = textArgs.split(/\s+/).slice(1).join(' ').trim();
                         if (!newModel) {
-                            await socket.sendMessage(targetChat, { text: `❌ Usage : ${currentPrefix}dazai model <nom>\nEx: ${currentPrefix}dazai model openai/gpt-4o-mini` }, { quoted: msg });
+                            await socket.sendMessage(targetChat, { text: `❌ Usage : ${currentPrefix}davai model <nom>\nEx: ${currentPrefix}davai model openai/gpt-4o-mini` }, { quoted: msg });
                         } else {
                             config.aiModel = newModel;
                             if (aiService) aiService.config.aiModel = newModel;
@@ -1852,8 +2082,8 @@ _Usage :_
 ${lines}
 
 _Usage :_
-• ${currentPrefix}dazai model <nom>
-• ${currentPrefix}dazai models ${target ? '<provider>' : ''}`
+• ${currentPrefix}davai model <nom>
+• ${currentPrefix}davai models ${target ? '<provider>' : ''}`
                             }, { quoted: msg });
                         }
                     } else if (arg === 'reload') {
@@ -1867,8 +2097,8 @@ _Usage :_
                         }
                         await socket.sendMessage(targetChat, { text: `🔄 Personnalité rechargée depuis personality.json (${n} provider${n === 1 ? '' : 's'}).` }, { quoted: msg });
                     } else if (arg === 'provider') {
-                        // ?dazai provider             → affiche primaire + chaîne
-                        // ?dazai provider <nom>       → bascule le primaire
+                        // ?davai provider             → affiche primaire + chaîne
+                        // ?davai provider <nom>       → bascule le primaire
                         const target = (textLower.split(/\s+/)[2] || '').trim();
                         if (!target) {
                             const available = SUPPORTED_PROVIDERS.map(p => {
@@ -1876,7 +2106,7 @@ _Usage :_
                                 const mark = p === (aiService && aiService.provider) ? ' ⭐' : '';
                                 return `  ${ok ? '🟢' : '⚪'} ${p}${mark}${ok ? '' : `  (clé ${envKeyForProvider(p)} absente)`}`;
                             }).join('\n');
-                            await socket.sendMessage(targetChat, { text: `🤖 *Provider IA*\n\nPrimaire : *${aiService ? aiService.provider : '(aucun)'}*\nChaîne fallback : ${aiChain.join(' → ') || '(vide)'}\n\n*Disponibles :*\n${available}\n\n_Usage :_ ${currentPrefix}dazai provider <nom>` }, { quoted: msg });
+                            await socket.sendMessage(targetChat, { text: `🤖 *Provider IA*\n\nPrimaire : *${aiService ? aiService.provider : '(aucun)'}*\nChaîne fallback : ${aiChain.join(' → ') || '(vide)'}\n\n*Disponibles :*\n${available}\n\n_Usage :_ ${currentPrefix}davai provider <nom>` }, { quoted: msg });
                         } else if (!SUPPORTED_PROVIDERS.includes(target)) {
                             await socket.sendMessage(targetChat, { text: `❌ Provider inconnu : \`${target}\`.\nValides : ${SUPPORTED_PROVIDERS.join(', ')}.` }, { quoted: msg });
                         } else {
@@ -1894,12 +2124,12 @@ _Usage :_
                             }
                         }
                     } else if (arg === 'chain') {
-                        // ?dazai chain                       → affiche la chaîne
-                        // ?dazai chain gemini groq cerebras  → fixe la chaîne
-                        // ?dazai chain reset                 → reconstruit la chaîne auto
+                        // ?davai chain                       → affiche la chaîne
+                        // ?davai chain gemini groq cerebras  → fixe la chaîne
+                        // ?davai chain reset                 → reconstruit la chaîne auto
                         const parts = textLower.split(/\s+/).slice(2).filter(Boolean);
                         if (!parts.length) {
-                            await socket.sendMessage(targetChat, { text: `🔗 *Chaîne fallback*\n${aiChain.length ? aiChain.map((p, i) => `${i + 1}. ${p}`).join('\n') : '_(vide)_'}\n\n_Usage :_\n- ${currentPrefix}dazai chain <p1> <p2>...   (ex: ${currentPrefix}dazai chain gemini groq cerebras)\n- ${currentPrefix}dazai chain reset` }, { quoted: msg });
+                            await socket.sendMessage(targetChat, { text: `🔗 *Chaîne fallback*\n${aiChain.length ? aiChain.map((p, i) => `${i + 1}. ${p}`).join('\n') : '_(vide)_'}\n\n_Usage :_\n- ${currentPrefix}davai chain <p1> <p2>...   (ex: ${currentPrefix}davai chain gemini groq cerebras)\n- ${currentPrefix}davai chain reset` }, { quoted: msg });
                         } else if (parts.length === 1 && parts[0] === 'reset') {
                             aiChain = buildDefaultChain();
                             await socket.sendMessage(targetChat, { text: `🔗 Chaîne réinitialisée : ${aiChain.join(' → ') || '(vide)'}` }, { quoted: msg });
@@ -1920,9 +2150,9 @@ _Usage :_
                             }
                         }
                     } else if (arg === 'key' || arg === 'keys' || arg === 'apikey' || arg === 'setkey') {
-                        // ?dazai key                        → liste les clés (masquées)
-                        // ?dazai key set <provider> <clé>   → écrit dans .env + init runtime
-                        // ?dazai key remove <provider>      → supprime de .env + du pool
+                        // ?davai key                        → liste les clés (masquées)
+                        // ?davai key set <provider> <clé>   → écrit dans .env + init runtime
+                        // ?davai key remove <provider>      → supprime de .env + du pool
                         //
                         // Les clés ne sont JAMAIS renvoyées en clair dans le chat :
                         // on masque `sk-…last4`. On persiste dans `.env` (ligne
@@ -1936,7 +2166,7 @@ _Usage :_
                         // Pour `set`, la clé peut contenir n'importe quoi sauf des
                         // espaces — on la reprend telle quelle depuis l'input
                         // original (textContent, sensible à la casse) après les
-                        // 4 premiers tokens : "<préfixe>dazai key set <provider>".
+                        // 4 premiers tokens : "<préfixe>davai key set <provider>".
                         // Skipper 3 tokens inclurait le nom du provider dans la
                         // clé et corromprait la valeur stockée dans .env.
                         const originalTokens = textContent.trim().split(/\s+/);
@@ -1992,12 +2222,12 @@ _Usage :_
                                 const tag = aiService && aiService.provider === p ? '  ⭐ actif' : (inPool ? '  (pool)' : '');
                                 return `${dot} *${p}* · \`${envName}\` = ${maskKey(val)}${tag}`;
                             }).join('\n');
-                            await socket.sendMessage(targetChat, { text: `🔐 *Clés API chatbot*\n\n${lines}\n\n*Usage*\n• ${currentPrefix}dazai key set <provider> <clé>\n• ${currentPrefix}dazai key remove <provider>\n\n_Providers :_ ${SUPPORTED_PROVIDERS.join(', ')}` }, { quoted: msg });
+                            await socket.sendMessage(targetChat, { text: `🔐 *Clés API chatbot*\n\n${lines}\n\n*Usage*\n• ${currentPrefix}davai key set <provider> <clé>\n• ${currentPrefix}davai key remove <provider>\n\n_Providers :_ ${SUPPORTED_PROVIDERS.join(', ')}` }, { quoted: msg });
                         } else if (action === 'set') {
                             if (!SUPPORTED_PROVIDERS.includes(provTarget)) {
                                 await socket.sendMessage(targetChat, { text: `❌ Provider inconnu : \`${provTarget}\`.\nValides : ${SUPPORTED_PROVIDERS.join(', ')}.` }, { quoted: msg });
                             } else if (!keyValue) {
-                                await socket.sendMessage(targetChat, { text: `❌ Clé manquante.\nUsage : ${currentPrefix}dazai key set ${provTarget} <clé>` }, { quoted: msg });
+                                await socket.sendMessage(targetChat, { text: `❌ Clé manquante.\nUsage : ${currentPrefix}davai key set ${provTarget} <clé>` }, { quoted: msg });
                             } else {
                                 const envName = envKeyForProvider(provTarget);
                                 try {
@@ -2051,12 +2281,12 @@ _Usage :_
                                 }
                             }
                         } else {
-                            await socket.sendMessage(targetChat, { text: `❌ Sous-commande inconnue : \`${action}\`.\nUsage :\n• ${currentPrefix}dazai key\n• ${currentPrefix}dazai key set <provider> <clé>\n• ${currentPrefix}dazai key remove <provider>` }, { quoted: msg });
+                            await socket.sendMessage(targetChat, { text: `❌ Sous-commande inconnue : \`${action}\`.\nUsage :\n• ${currentPrefix}davai key\n• ${currentPrefix}davai key set <provider> <clé>\n• ${currentPrefix}davai key remove <provider>` }, { quoted: msg });
                         }
                     } else if (arg === 'allow' || arg === 'block' || arg === 'romantic' || arg === 'copine' || arg === 'copines') {
-                        // ?dazai allow   add|remove|list|clear [numéro]  → whitelist IA
-                        // ?dazai block   add|remove|list|clear [numéro]  → blacklist IA
-                        // ?dazai romantic add|remove|list|clear [numéro] → copines (mode romantique)
+                        // ?davai allow   add|remove|list|clear [numéro]  → whitelist IA
+                        // ?davai block   add|remove|list|clear [numéro]  → blacklist IA
+                        // ?davai romantic add|remove|list|clear [numéro] → copines (mode romantique)
                         const normArg = (arg === 'copine' || arg === 'copines') ? 'romantic' : arg;
                         const listKey = normArg === 'allow'
                             ? 'aiAllowedNumbers'
@@ -2088,8 +2318,8 @@ _Usage :_
                                 ? `_Si vide, le bot répond à *tous* les contacts. Sinon il ne répond qu'à ceux listés._`
                                 : normArg === 'block'
                                     ? `_Les contacts listés ne reçoivent jamais de réponse IA, même s'ils sont dans la whitelist._`
-                                    : `_Les contacts listés déclenchent la personnalité ROMANTIQUE (mots doux : bébé / mon cœur / ma belle / chérie / bb). Les autres gardent le Daziano standard._`;
-                            await socket.sendMessage(targetChat, { text: `🤖 *${label}* (${list.length})\n${list.length ? list.map(n => '• +' + n).join('\n') : '_(vide)_'}\n\n${hint}\n\n*Usage*\n- ${currentPrefix}dazai ${normArg} add <numéro>\n- ${currentPrefix}dazai ${normArg} remove <numéro>\n- ${currentPrefix}dazai ${normArg} clear` }, { quoted: msg });
+                                    : `_Les contacts listés déclenchent la personnalité ROMANTIQUE (mots doux : bébé / mon cœur / ma belle / chérie / bb). Les autres gardent le David standard._`;
+                            await socket.sendMessage(targetChat, { text: `🤖 *${label}* (${list.length})\n${list.length ? list.map(n => '• +' + n).join('\n') : '_(vide)_'}\n\n${hint}\n\n*Usage*\n- ${currentPrefix}davai ${normArg} add <numéro>\n- ${currentPrefix}davai ${normArg} remove <numéro>\n- ${currentPrefix}davai ${normArg} clear` }, { quoted: msg });
                         }
                     } else {
                         // ── Status chatbot IA : rendu "dashboard" lisible (banner
@@ -2142,25 +2372,28 @@ _Usage :_
 ━━━━━━━━━━━━━━━━━━━━━━
 ⚙️  *RACCOURCIS*
 ━━━━━━━━━━━━━━━━━━━━━━
-◦ *${p}dazai on* / *off*         _activer / couper_
-◦ *${p}dazai stats*              _compteurs_
-◦ *${p}dazai contacts*           _conversations en cours_
-◦ *${p}dazai provider* _nom_       _switch primaire_
-◦ *${p}dazai model* _nom_          _change le modèle actif_
-◦ *${p}dazai chain* _p1 p2 …|reset_  _ordre fallback_
-◦ *${p}dazai reload*             _recharge personality.json_
-◦ *${p}dazai clear* [_all_]         _reset historique_
+◦ *${p}davai on* / *off*         _activer / couper_
+◦ *${p}davai stats*              _compteurs_
+◦ *${p}davai contacts*           _conversations en cours_
+◦ *${p}davai provider* _nom_       _switch primaire_
+◦ *${p}davai model* _nom_          _change le modèle actif_
+◦ *${p}davai chain* _p1 p2 …|reset_  _ordre fallback_
+◦ *${p}davai reload*             _recharge personality.json_
+◦ *${p}davai clear* [_all_]         _reset historique_
 
 ━━━━━━━━━━━━━━━━━━━━━━
 👥  *FILTRES*
 ━━━━━━━━━━━━━━━━━━━━━━
-◦ *${p}dazai allow* _add/remove/list/clear_ _num_
-◦ *${p}dazai block* _add/remove/list/clear_ _num_
-◦ *${p}dazai romantic* _add/remove/list/clear_ _num_
+◦ *${p}davai allow* _add/remove/list/clear_ _num_
+◦ *${p}davai block* _add/remove/list/clear_ _num_
+◦ *${p}davai romantic* _add/remove/list/clear_ _num_
    _→ mots doux : bébé / mon cœur / ma belle / chérie / bb_`;
                         await socket.sendMessage(targetChat, { text: statusText }, { quoted: msg });
                     }
                 } else if (cmd === 'menu' || cmd === 'help' || cmd === 'h' || cmd === 'guide') {
+                    // ── Alias de compatibilité : les anciennes commandes
+                    // "daz*" restent reconnues en interne mais sont désormais
+                    // exposées sous "dav*". (ex: ?dazai → ?davai)
                     const p = currentPrefix;
                     // ── Uptime compact (xj xh xm)
                     const upSec = Math.max(0, Math.floor(Date.now() / 1000) - botStartTime);
@@ -2169,7 +2402,7 @@ _Usage :_
                     const um = Math.floor((upSec % 3600) / 60);
                     const uptime = ud ? `${ud}j ${uh}h ${um}m` : uh ? `${uh}h ${um}m` : `${um}m`;
                     const aiDot = aiService && config.aiAutoReply ? '🟢' : aiService ? '🟡' : '🔴';
-                    const ownerTag = config.ownerName || 'DAZ';
+                    const ownerTag = config.ownerName || 'DAV';
                     const senderJid = msg.key.participant || msg.key.remoteJid;
                     const senderName = senderJid.split('@')[0];
 
@@ -2197,23 +2430,23 @@ ${lines.map(l => `│ ${l}`).join('\n')}
 ╰━━━━━━━━━━━━⬣
 
 ${section('💖', 'LIKE CIBLÉ', [
-    `✨ ${p}dazonly add _num_ _emoji_`,
-    `🗑️ ${p}dazonly remove _num_`,
-    `📜 ${p}dazonly list`,
-    `🛑 ${p}dazonly off`,
+    `✨ ${p}davonly add _num_ _emoji_`,
+    `🗑️ ${p}davonly remove _num_`,
+    `📜 ${p}davonly list`,
+    `🛑 ${p}davonly off`,
 ])}
 
 ${section('📸', 'STATUS · VISION', [
-    `❤️ ${p}dazstatus on|off  _like tous_`,
-    `⛔ ${p}dazstatus block add/remove/list/off  _bloque un statut_`,
-    `👁️ ${p}dazview on|off    _vision seule_`,
-    `🤫 ${p}dazdiscrete add _num_`,
-    `📋 ${p}dazdiscrete list`,
-    `🎭 ${p}dazstatusuni _emoji|random_`,
-    `🎞️ ${p}dazsticker  📎`,
-    `📊 ${p}dazstats             _globales_`,
-    `📅 ${p}dazstats jour        _aujourd'hui_`,
-    `🗓️ ${p}dazstats semaine     _7 jours_`,
+    `❤️ ${p}davstatus on|off  _like tous_`,
+    `⛔ ${p}davstatus block add/remove/list/off  _bloque un statut_`,
+    `👁️ ${p}davview on|off    _vision seule_`,
+    `🤫 ${p}davdiscrete add _num_`,
+    `📋 ${p}davdiscrete list`,
+    `🎭 ${p}davstatusuni _emoji|random_`,
+    `🎞️ ${p}davsticker  📎`,
+    `📊 ${p}davstats             _globales_`,
+    `📅 ${p}davstats jour        _aujourd'hui_`,
+    `🗓️ ${p}davstats semaine     _7 jours_`,
 ])}
 
 ${section('🛡️', 'PROTECTION', [
@@ -2221,9 +2454,9 @@ ${section('🛡️', 'PROTECTION', [
     `🔛 ${p}antidelete on|off      _tout_`,
     `📸 ${p}antidelete statut on|off`,
     `🙈 ${p}antidelete skip add|remove|list|clear`,
-    `🚫 ${p}dazantionly add _num_`,
-    `📋 ${p}dazantionly remove|list|off`,
-    `👀 ${p}dazvv on|off  _vue-unique_`,
+    `🚫 ${p}davantionly add _num_`,
+    `📋 ${p}davantionly remove|list|off`,
+    `👀 ${p}davvv on|off  _vue-unique_`,
 ])}
 
 ${section('⏰', 'PLANIFICATEUR', [
@@ -2237,22 +2470,22 @@ ${section('⏰', 'PLANIFICATEUR', [
 ])}
 
 ${section('🧠', 'CHATBOT IA', [
-    `📊 ${p}dazai          _dashboard_`,
-    `🔛 ${p}dazai on|off`,
-    `🔌 ${p}dazai provider _nom_`,
-    `🔗 ${p}dazai chain _p1 p2 …_`,
-    `✅ ${p}dazai allow|block add|remove|list`,
-    `💕 ${p}dazai romantic add|remove|list`,
-    `🎛️ ${p}dazai model _nom_`,
-    `🧾 ${p}dazai models [_provider_]  _modèles disponibles_`,
-    `🔐 ${p}dazai key set/remove/list`,
-    `♻️ ${p}dazai reload / clear [all] / stats`,
+    `📊 ${p}davai          _dashboard_`,
+    `🔛 ${p}davai on|off`,
+    `🔌 ${p}davai provider _nom_`,
+    `🔗 ${p}davai chain _p1 p2 …_`,
+    `✅ ${p}davai allow|block add|remove|list`,
+    `💕 ${p}davai romantic add|remove|list`,
+    `🎛️ ${p}davai model _nom_`,
+    `🧾 ${p}davai models [_provider_]  _modèles disponibles_`,
+    `🔐 ${p}davai key set/remove/list`,
+    `♻️ ${p}davai reload / clear [all] / stats`,
 ])}
 
 ${section('⚙️', 'CONFIG & SYSTÈME', [
     `🔣 ${p}setprefix _symbole_`,
-    `📣 ${p}dazconnect show|on|off`,
-    `🔄 ${p}dazreset   _reset focus_`,
+    `📣 ${p}davconnect show|on|off`,
+    `🔄 ${p}davreset   _reset focus_`,
     `📱 ${p}pair qr    _génère un QR PNG_`,
     `🖥️ ${p}host       _infos serveur_`,
 ])}
@@ -2264,7 +2497,7 @@ ${section('⚙️', 'CONFIG & SYSTÈME', [
 ╰━━━━━━━━━━━━⬣
 
 ✨ _Et tout ça, c'est le destin_ 🫠
-> 🤖 *PRODUCED BY DAZBOT* · _by ${ownerTag}_`;
+> 🤖 *PRODUCED BY DAVIDBOT* · _by ${ownerTag}_`;
 
                     // Envoi avec la bannière configurée (même fallback que
                     // tagall : si l'image échoue, on retombe sur du texte).
@@ -2332,10 +2565,10 @@ ${section('⚙️', 'CONFIG & SYSTÈME', [
                 }
             }
 
-            // --- AI AUTO-REPLY (chatbot IA porté depuis Chat-Bot-Dazi) ---
+            // --- AI AUTO-REPLY (chatbot IA porté depuis Chat-Bot-Dav) ---
             // Répond aux messages texte non-commandes reçus en privé (ou groupes
             // si aiRespondToGroups=true). Désactivé par défaut, doit être activé
-            // avec ?dazai on. Fallback silencieux si l'IA est HS.
+            // avec ?davai on. Fallback silencieux si l'IA est HS.
             if (
                 aiService &&
                 config.aiAutoReply &&
@@ -2364,7 +2597,7 @@ ${section('⚙️', 'CONFIG & SYSTÈME', [
                     const blockedHit = blocked.includes(senderNumber);
                     const allowedHit = allowed.length === 0 || allowed.includes(senderNumber);
                     // Mode personnalité : 'romantic' si le numéro est dans la liste
-                    // des copines, sinon 'default' (Daziano standard).
+                    // des copines, sinon 'default' (dav standard).
                     const personalityMode = romantic.includes(senderNumber) ? 'romantic' : 'default';
 
                     // Scope historique : en groupe on garde un thread par (groupe+participant)
@@ -2422,14 +2655,14 @@ ${section('⚙️', 'CONFIG & SYSTÈME', [
                                         }[provider] || { keys: '(doc provider)', billing: '(doc provider)' };
                                         const providerLabel = provider.charAt(0).toUpperCase() + provider.slice(1);
                                         const reason = status === 429
-                                            ? `⏳ Quota ${providerLabel} dépassé (rate-limit / requêtes par jour).\n${provider === 'gemini' ? `Le plan gratuit Gemini est limité à ~250 req/jour sur gemini-2.5-flash. Essaie un modèle plus généreux :\n• ${config.prefix || '?'}dazai model gemini-2.5-flash-lite  (1000 req/jour)\n• ${config.prefix || '?'}dazai model gemini-2.0-flash        (200 req/jour, 1M TPM)\nOu attends ~24h pour le reset, ou recharge : ${urls.billing}` : `Attends quelques minutes, ou change de modèle : ${config.prefix || '?'}dazai model <autre-modèle>\nDoc quotas : ${urls.billing}`}`
+                                            ? `⏳ Quota ${providerLabel} dépassé (rate-limit / requêtes par jour).\n${provider === 'gemini' ? `Le plan gratuit Gemini est limité à ~250 req/jour sur gemini-2.5-flash. Essaie un modèle plus généreux :\n• ${config.prefix || '?'}davai model gemini-2.5-flash-lite  (1000 req/jour)\n• ${config.prefix || '?'}davai model gemini-2.0-flash        (200 req/jour, 1M TPM)\nOu attends ~24h pour le reset, ou recharge : ${urls.billing}` : `Attends quelques minutes, ou change de modèle : ${config.prefix || '?'}davai model <autre-modèle>\nDoc quotas : ${urls.billing}`}`
                                             : status === 402
                                                 ? `💳 Quota ${providerLabel} épuisé (paiement requis).\nVérifie ta facturation : ${urls.billing}`
                                                 : status === 401
                                                     ? `🔑 Clé ${providerLabel} invalide ou révoquée.\nRégénère une clé : ${urls.keys}`
                                                     : `⛔ Accès refusé par ${providerLabel} (status 403) — quota gratuit dépassé, modèle indisponible dans ta région ou compte bloqué.`;
                                         try {
-                                            await socket.sendMessage(ownerJid, { text: `⚠️ *Chatbot IA en échec*\n\n${reason}\n\n_L'auto-reply est toujours ON mais ne peut pas répondre tant que ce n'est pas résolu. Fais ${config.prefix || '?'}dazai off pour le couper._` });
+                                            await socket.sendMessage(ownerJid, { text: `⚠️ *Chatbot IA en échec*\n\n${reason}\n\n_L'auto-reply est toujours ON mais ne peut pas répondre tant que ce n'est pas résolu. Fais ${config.prefix || '?'}davai off pour le couper._` });
                                         } catch (_) {}
                                     }
                                 }
@@ -2544,7 +2777,7 @@ ${section('⚙️', 'CONFIG & SYSTÈME', [
                         }
 
                         // Si un focus est actif mais cette personne n'en fait pas partie,
-                        // on ne like PAS (conformément à la description de ?dazonly).
+                        // on ne like PAS (conformément à la description de ?davonly).
                         if (focusTargets.size > 0) {
                             console.log(`[FOCUS-SKIP] +${senderPhoneNumber} ignoré (focus actif, non ciblé)`);
                             await socket.sendPresenceUpdate('unavailable', senderJid);
@@ -2708,7 +2941,13 @@ process.on('SIGINT', async () => {
 });
 
 // --- KEEP ALIVE ---
-const RENDER_URL = "https://dazbot.onrender.com";
-setInterval(async () => {
-    try { await fetch(RENDER_URL); } catch (e) { }
-}, 5 * 60 * 1000);
+// Keep-alive OPTIONNEL : ne pinguer que si DAVID_KEEPALIVE_URL est défini
+// dans le .env (ex: URL Render/Railway du déploiement). Avant, une URL codée
+// en dur (l'ancienne URL Render du projet) était pinguée en boucle, même sans
+// déploiement Render — requêtes inutiles vers un domaine tiers.
+const KEEP_ALIVE_URL = process.env.DAVID_KEEPALIVE_URL || "";
+if (KEEP_ALIVE_URL) {
+    setInterval(async () => {
+        try { await fetch(KEEP_ALIVE_URL); } catch (e) { }
+    }, 5 * 60 * 1000);
+}

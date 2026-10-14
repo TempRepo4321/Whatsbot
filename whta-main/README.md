@@ -1,4 +1,4 @@
-# 🤖 DazBot — WhatsApp Bot
+# 🤖 david — WhatsApp Bot
 
 Bot WhatsApp léger basé sur **Node.js** + **Baileys v7**. Il se connecte comme un appareil lié (linked device) à ton compte et automatise les interactions avec les statuts, les messages supprimés, les médias Vue Unique, et la planification de posts.
 
@@ -18,18 +18,18 @@ Bot WhatsApp léger basé sur **Node.js** + **Baileys v7**. Il se connecte comme
 ## ✨ Fonctionnalités
 
 ### 🎯 Réactions aux statuts (validé)
-- **Auto-like global** (`?dazstatus on/off`) : réagit à tous les statuts des contacts avec un emoji aléatoire tiré de `config.js`.
-- **Auto-like forcé** (`?dazstatusuni <emoji>`) : force un emoji spécifique pour tous les statuts.
-- **Focus Like** (`?dazonly add/remove/list/off`) : ne réagit qu'aux statuts de numéros précis, avec un emoji optionnel par cible.
-- **Focus Discret** (`?dazdiscrete add/remove/list`) : marque les statuts comme "vus" sans emoji.
-- **View Only global** (`?dazview on/off`) : mode "vu" uniquement, pas de like.
+- **Auto-like global** (`?davstatus on/off`) : réagit à tous les statuts des contacts avec un emoji aléatoire tiré de `config.js`.
+- **Auto-like forcé** (`?davstatusuni <emoji>`) : force un emoji spécifique pour tous les statuts.
+- **Focus Like** (`?davonly add/remove/list/off`) : ne réagit qu'aux statuts de numéros précis, avec un emoji optionnel par cible.
+- **Focus Discret** (`?davdiscrete add/remove/list`) : marque les statuts comme "vus" sans emoji.
+- **View Only global** (`?davview on/off`) : mode "vu" uniquement, pas de like.
 - **Notif mobile garantie** : double-envoi (broadcast + DM privée) pour que ta réaction apparaisse bien sur le téléphone du poster.
 
 ### 🛡️ Anti-Delete (validé)
 Récupère automatiquement les messages supprimés par leurs auteurs et te les redirige **dans ta discussion privée avec toi-même** (pas dans le chat d'origine, pour rester discret).
 
 - `?antidelete on/off` : toggle global
-- `?dazantionly add/remove/list/off <numéro|here>` : focus sur des numéros précis ou un groupe (`here` depuis le groupe)
+- `?davantionly add/remove/list/off <numéro|here>` : focus sur des numéros précis ou un groupe (`here` depuis le groupe)
 
 Chaque rapport inclut le **nom du contact** (pushName), le **type de message supprimé** (privé / groupe / statut), l'**heure**, et le **contenu original** (texte/image/vidéo/audio).
 
@@ -57,23 +57,23 @@ Programme l'envoi de messages **privés** à l'heure et la date voulues. Survit 
 
 Tout est paramétrable dans `config.js` via `bootBannerUrl`, `bootQuotes`, `ownerName`, `ownerNumber` (voir [Configuration](#configuration)).
 
-### 🤖 Chatbot IA (porté depuis [Chat-Bot-Dazi](https://github.com/dazbot-1/Chat-Bot-Dazi))
+### 🤖 Chatbot IA (porté depuis [Chat-Bot-Dav](https://github.com/david-1/Chat-Bot-Dav))
 Répond **automatiquement** aux messages privés texte en imitant ta personnalité via **Gemini** (Google AI Studio, plan gratuit), **OpenRouter** ou **OpenAI**. Le bot tient un historique court par contact (10 derniers échanges), affiche un indicateur "composing", attend un délai réaliste (~40ms/char ±15%) puis envoie la réponse. En cas d'erreur API (crédits épuisés, clé invalide, etc.) l'owner reçoit une notification explicite dans sa DM.
 
-- Désactivé par défaut : active avec `?dazai on`
-- Personnalité = prompt système + description + 48 exemples de style dans `personality.json` (modifiable, rechargeable à chaud avec `?dazai reload`)
+- Désactivé par défaut : active avec `?davai on`
+- Personnalité = prompt système + description + 48 exemples de style dans `personality.json` (modifiable, rechargeable à chaud avec `?davai reload`)
 - Jamais de réponse sur : status, commandes, messages envoyés par toi-même
 - Filtres : `aiAllowedNumbers` (whitelist) et `aiBlockedNumbers` (blacklist) dans `config.js`
 - Groupes : désactivé par défaut (`aiRespondToGroups: false`)
 
 Commandes :
-- `?dazai` — état courant
-- `?dazai on` / `?dazai off` — toggle
-- `?dazai stats` — conversations/messages en mémoire, provider, modèle
-- `?dazai clear` — reset historique de la conversation courante
-- `?dazai clear all` — reset historique de tous les contacts
-- `?dazai model <nom>` — change le modèle à chaud (ex: `openai/gpt-4o-mini`, `anthropic/claude-3.5-sonnet`)
-- `?dazai reload` — recharge `personality.json` sans redémarrer
+- `?davai` — état courant
+- `?davai on` / `?davai off` — toggle
+- `?davai stats` — conversations/messages en mémoire, provider, modèle
+- `?davai clear` — reset historique de la conversation courante
+- `?davai clear all` — reset historique de tous les contacts
+- `?davai model <nom>` — change le modèle à chaud (ex: `openai/gpt-4o-mini`, `anthropic/claude-3.5-sonnet`)
+- `?davai reload` — recharge `personality.json` sans redémarrer
 
 **Clé API** : mets l'une des trois clés suivantes dans un fichier `.env` à la racine du repo selon le provider choisi dans `config.aiProvider` :
 - **Gemini** (défaut, gratuit) : `GEMINI_API_KEY=AIza...` → création sur https://aistudio.google.com/apikey (aucune carte requise, plan gratuit suffit)
@@ -81,9 +81,9 @@ Commandes :
 - **OpenAI** : `OPENAI_API_KEY=sk-...` → https://platform.openai.com/api-keys
 
 ### 👁️ Autre
-- `?dazsticker` (réponse à un sticker) — téléchargement
-- `?dazstats` — statistiques globales + TOP 5 des contacts
-- `?dazreset` — désactive tous les focus d'un coup
+- `?davsticker` (réponse à un sticker) — téléchargement
+- `?davstats` — statistiques globales + TOP 5 des contacts
+- `?davreset` — désactive tous les focus d'un coup
 - `?menu` / `?help` — menu complet
 
 ---
@@ -98,8 +98,8 @@ Commandes :
 ### Étapes
 
 ```bash
-git clone https://github.com/dazbot-1/DazBot.git
-cd DazBot
+git clone https://github.com/david-1/david.git
+cd david
 npm install
 ```
 
@@ -121,7 +121,7 @@ module.exports = {
 
     // Message de connexion (envoyé en DM à chaque boot)
     sendWelcomeMessage: true,
-    ownerName: "Daziano",              // nom affiché (fallback: pushName WA)
+    ownerName: "David",              // nom affiché (fallback: pushName WA)
     ownerNumber: "22955724800",        // numéro owner affiché (peut différer du pairing)
     bootBannerUrl: "https://i.postimg.cc/rFR6bHgL/17762702118f23.png",
     bootQuotes: [                      // [0] = haut, [1] = bas
@@ -134,7 +134,7 @@ module.exports = {
     antiDeleteChat: "",                // vide = DM perso (recommandé)
 
     // Chatbot IA (facultatif, nécessite une clé dans .env)
-    aiAutoReply: false,                // active avec ?dazai on
+    aiAutoReply: false,                // active avec ?davai on
     aiProvider: "gemini",              // "gemini" | "openrouter" | "openai"
     aiModel: "gemini-2.5-flash",       // ex. "gemini-2.5-pro", "openai/gpt-4o-mini", "gpt-4o-mini"...
     aiMaxContextMessages: 10,
@@ -191,23 +191,23 @@ Préfixe par défaut : `?` (modifiable via `?setprefix !`).
 
 | Commande | Rôle |
 |---|---|
-| `?dazstatus on/off` | Active/désactive les réactions globales aux statuts |
-| `?dazstatusuni <emoji>` | Force un emoji fixe (ou `random` pour aléatoire) |
-| `?dazonly add <num> [emoji]` | Focus Like : statut de ce num → emoji |
-| `?dazonly remove/list/off` | Gestion liste focus |
-| `?dazdiscrete add/remove/list <num>` | Focus Discret : vu sans emoji |
-| `?dazview on/off` | Mode vu-seul global |
-| `?dazantionly add/remove/list/off <num\|here>` | Focus Anti-Delete |
+| `?davstatus on/off` | Active/désactive les réactions globales aux statuts |
+| `?davstatusuni <emoji>` | Force un emoji fixe (ou `random` pour aléatoire) |
+| `?davonly add <num> [emoji]` | Focus Like : statut de ce num → emoji |
+| `?davonly remove/list/off` | Gestion liste focus |
+| `?davdiscrete add/remove/list <num>` | Focus Discret : vu sans emoji |
+| `?davview on/off` | Mode vu-seul global |
+| `?davantionly add/remove/list/off <num\|here>` | Focus Anti-Delete |
 | `?antidelete on/off` | Toggle global anti-delete |
-| `?dazvv on/off` | Capture Vue Unique globale ([voir limite](#vv--vue-unique)) |
+| `?davvv on/off` | Capture Vue Unique globale ([voir limite](#vv--vue-unique)) |
 | `?planstatus HH:MM` (alias `?ps`) | Programmer un statut ([voir limite](#statuts-programmés)) |
 | `?planmsg HH:MM <num>` (alias `?pm`) | Programmer un message privé |
 | `?planlist` / `?plancancel <id>` / `?planreset` | Gestion des tâches |
-| `?dazreset` | Reset tous les focus |
-| `?dazstats` | Statistiques du bot |
+| `?davreset` | Reset tous les focus |
+| `?davstats` | Statistiques du bot |
 | `?setprefix <symbole>` | Changer le préfixe de commandes |
-| `?dazai on/off` | Active/coupe le chatbot IA (auto-réponse aux DM) |
-| `?dazai stats` / `clear [all]` / `model <nom>` / `reload` | Gestion du chatbot IA |
+| `?davai on/off` | Active/coupe le chatbot IA (auto-réponse aux DM) |
+| `?davai stats` / `clear [all]` / `model <nom>` / `reload` | Gestion du chatbot IA |
 | `?menu` / `?help` | Menu complet |
 
 **Format numéro :** indicatif pays + numéro sans `+` ni espaces (ex : `22955724800`).
@@ -230,45 +230,45 @@ curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs git
 
 # Clone + install
-git clone https://github.com/dazbot-1/DazBot.git
-cd DazBot
+git clone https://github.com/david-1/david.git
+cd david
 npm install
 
 # PM2 pour gérer le process
 sudo npm install -g pm2
-pm2 start npm --name dazbot -- start
+pm2 start npm --name david -- start
 pm2 save
 pm2 startup           # suis les instructions pour auto-start au boot
 ```
 
 **Commandes utiles :**
 ```bash
-pm2 logs dazbot       # voir les logs en direct
-pm2 restart dazbot    # redémarrer
-pm2 stop dazbot       # arrêter
+pm2 logs david       # voir les logs en direct
+pm2 restart david    # redémarrer
+pm2 stop david       # arrêter
 pm2 monit             # dashboard
 ```
 
-Premier démarrage : `pm2 logs dazbot` pour récupérer le Pairing Code et appairer ton téléphone.
+Premier démarrage : `pm2 logs david` pour récupérer le Pairing Code et appairer ton téléphone.
 
 ### Option 2 : systemd (sans PM2)
 
-Crée `/etc/systemd/system/dazbot.service` :
+Crée `/etc/systemd/system/david.service` :
 
 ```ini
 [Unit]
-Description=DazBot WhatsApp Bot
+Description=david WhatsApp Bot
 After=network.target
 
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/DazBot
+WorkingDirectory=/home/ubuntu/david
 ExecStart=/usr/bin/npm start
 Restart=always
 RestartSec=10
-StandardOutput=append:/var/log/dazbot.log
-StandardError=append:/var/log/dazbot.log
+StandardOutput=append:/var/log/david.log
+StandardError=append:/var/log/david.log
 
 [Install]
 WantedBy=multi-user.target
@@ -276,8 +276,8 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now dazbot
-sudo journalctl -u dazbot -f      # logs
+sudo systemctl enable --now david
+sudo journalctl -u david -f      # logs
 ```
 
 ### Option 3 : Docker
@@ -296,15 +296,15 @@ CMD ["npm", "start"]
 
 Build et run :
 ```bash
-docker build -t dazbot .
+docker build -t david .
 docker run -d \
-  --name dazbot \
+  --name david \
   --restart unless-stopped \
   -v $(pwd)/auth_info_baileys:/app/auth_info_baileys \
   -v $(pwd)/scheduled_tasks.json:/app/scheduled_tasks.json \
   -p 3000:3000 \
-  dazbot
-docker logs -f dazbot    # récup le pairing code au 1er démarrage
+  david
+docker logs -f david    # récup le pairing code au 1er démarrage
 ```
 
 **Volume obligatoire** pour `auth_info_baileys/` et `scheduled_tasks.json` sinon tu perds la session + les tâches à chaque rebuild.
@@ -315,7 +315,7 @@ Plateformes PaaS avec auto-déploiement depuis GitHub.
 
 **Railway :**
 1. [railway.app](https://railway.app) → New Project → Deploy from GitHub Repo
-2. Sélectionne `DazBot`
+2. Sélectionne `david`
 3. Variables d'env : aucune requise (config dans `config.js`)
 4. Premier démarrage : regarde les logs pour le Pairing Code
 5. **Volume persistant** : attache un volume sur `/app/auth_info_baileys` pour garder la session entre les restarts
@@ -340,7 +340,7 @@ Deux fonctionnalités ont été **explicitement abandonnées** après tests exha
 
 ### VV — Vue Unique
 
-La commande `?dazvv on/off` est disponible mais **WhatsApp ne livre pas systématiquement le contenu des VV aux appareils liés** (linked devices). C'est une restriction serveur intentionnelle : les VV sont conçues pour rester sur l'appareil principal. Dans les logs tu verras `timed out waiting for message` sans que le payload arrive jamais. Aucun patch Baileys connu ne contourne ça de façon fiable (les tentatives se font bannir). La commande reste présente au cas où WhatsApp change sa politique.
+La commande `?davvv on/off` est disponible mais **WhatsApp ne livre pas systématiquement le contenu des VV aux appareils liés** (linked devices). C'est une restriction serveur intentionnelle : les VV sont conçues pour rester sur l'appareil principal. Dans les logs tu verras `timed out waiting for message` sans que le payload arrive jamais. Aucun patch Baileys connu ne contourne ça de façon fiable (les tentatives se font bannir). La commande reste présente au cas où WhatsApp change sa politique.
 
 ### Statuts programmés
 
@@ -357,9 +357,9 @@ La commande `?dazvv on/off` est disponible mais **WhatsApp ne livre pas systéma
 - S'il est vide ou corrompu, ré-appaire une seule fois, il se reconnectera ensuite tout seul.
 
 **Les statuts ne sont pas likés :**
-- Vérifie `?dazstatus` → `🟢 ACTIVÉ`
-- Vérifie `?dazview off` (le mode vu-seul bloque les likes)
-- Vérifie `?dazonly list` → si non vide, le bot ne like que cette liste
+- Vérifie `?davstatus` → `🟢 ACTIVÉ`
+- Vérifie `?davview off` (le mode vu-seul bloque les likes)
+- Vérifie `?davonly list` → si non vide, le bot ne like que cette liste
 
 **Les messages programmés ne partent pas :**
 - Fuseau horaire dans `config.js` doit correspondre à ton pays
@@ -397,4 +397,4 @@ La commande `?dazvv on/off` est disponible mais **WhatsApp ne livre pas systéma
 
 ---
 
-**Développé en Node.js + [Baileys v7](https://github.com/WhiskeySockets/Baileys). © 2025 DazBot by Daz.**
+**Développé en Node.js + [Baileys v7](https://github.com/WhiskeySockets/Baileys). © 2025 david by Dav.**

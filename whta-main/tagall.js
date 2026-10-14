@@ -50,7 +50,7 @@ const executeTagAll = async (sock, msg) => {
         const tagList = mentions.map(id => `│ 👤 @${id.split('@')[0]}`).join('\n');
 
         const caption = `╭───────◇\n` +
-                        `│ 🤖 *DAZBOT - TAGALL* 🤖\n` +
+                        `│ 🤖 *david - TAGALL* 🤖\n` +
                         `╰───────◇\n\n` +
                         `👥 *Groupe* : ${groupMeta.subject}\n` +
                         `👤 *Auteur* : @${senderName}\n` +
@@ -60,7 +60,7 @@ const executeTagAll = async (sock, msg) => {
                         `╭───〔 LISTE 〕───⬣\n` +
                         `${tagList}\n` +
                         `╰──────────────⬣\n\n` +
-                        `> PRODUCED BY DAZBOT`;
+                        `> PRODUCED BY david`;
 
         try {
             await sock.sendMessage(
