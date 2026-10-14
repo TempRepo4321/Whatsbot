@@ -356,9 +356,18 @@ const takeVVKey = (id) => {
     const rootId = (id || '').replace(/^BA5/, '');
     const entry = vvPendingKeys.get(rootId);
     if (!entry) return null;
-    vvPendingKeys.delete(rootId);
-    if (Date.now() - entry.at > VV_PENDING_TTL_MS) return null;
+    // Ne PAS supprimer ici : le téléphone peut re-livrer plusieurs fois
+    // (update + upsert). L'anti-doublon alreadyProcessedVV bloque les
+    // doublons ; la purge TTL ci-dessous nettoie la Map.
+    if (Date.now() - entry.at > VV_PENDING_TTL_MS) { vvPendingKeys.delete(rootId); return null; }
     return entry.key;
+};
+// Compteurs de diagnostic VV — affichés par ?davvv et ?davdiag pour savoir
+// exactement où se situe le blocage (réception / resend / restauration / capture).
+const vvDiag = { received: 0, redelivered: 0, restored: 0, captured: 0, lastEvent: 'aucun', lastReceivedAt: null };
+const vvMark = (what, detail) => {
+    vvDiag.lastEvent = `${what}${detail ? ` (${String(detail).slice(0, 60)})` : ''}`;
+    if (what === 'received') vvDiag.lastReceivedAt = new Date().toISOString();
 };
 
 let isActivelyLiking = true;
@@ -477,6 +486,27 @@ const getStatusAudience = async () => {
 // placeholder) pour lesquels une re-délivrance est espérée via le pont
 // messages.update → upsert. Affiché par ?davvv (diagnostic).
 let vvPendingCount = 0;
+
+// Registre des VV en attente de re-délivrance : rootId -> key complète du
+// message stub. Alimenté par le pipeline VV (1er passage sans mediaKey),
+// consommé par le pont messages.update → upsert et par la commande ?davvv
+// (vue "En attente"). Purge automatique après VV_PENDING_TTL_MS.
+const vvPendingRegistry = new Map();
+const registerVVWaiting = (rootId, key) => {
+    if (!rootId || !key) return;
+    vvPendingRegistry.set(rootId, { key, at: Date.now() });
+    vvPendingCount = vvPendingRegistry.size;
+};
+const unregisterVVWaiting = (rootId) => {
+    if (vvPendingRegistry.delete(rootId)) vvPendingCount = vvPendingRegistry.size;
+};
+const purgeVVWaiting = () => {
+    const now = Date.now();
+    for (const [id, e] of vvPendingRegistry) {
+        if (now - e.at > VV_PENDING_TTL_MS) vvPendingRegistry.delete(id);
+    }
+    vvPendingCount = vvPendingRegistry.size;
+};
 
 const botStats = {
     statusRead: 0,
@@ -652,6 +682,16 @@ function isAllowed(jid, msg) {
     return true;
 }
 
+// ── FIX "le bot se déconnecte/redémarre trop vite" ─────────────────────
+// Ces compteurs étaient DÉCLARÉS À L'INTÉRIEUR de connectToWhatsApp() :
+// chaque reconnexion recréait une variable locale repartant de 0 → le
+// backoff ne montait jamais et le nombre de tentatives n'était jamais
+// atteint → boucle de reconnexion toutes les ~5 s (l'impression de
+// redémarrages permanents). Ils sont désormais globaux au module.
+let reconnectAttempts = 0;      // échecs consécutifs (reset si connexion OK)
+let lastCloseAt = 0;            // anti-boucle : espacement minimum entre fermetures
+const MAX_CONSECUTIVE_401 = 5;  // au-delà : session morte, stop + re-scan QR
+
 async function connectToWhatsApp() {
     console.log('[INFO] Chargement de la session WhatsApp locale...');
     try {
@@ -804,12 +844,19 @@ async function connectToWhatsApp() {
                     k === 'ephemeralMessage' || k === 'deviceSentMessage');
                 if (!hasMedia) continue;
                 const rootId = u.key.id.replace(/^BA5/, '');
-                if (!alreadyProcessedVV(rootId)) continue; // pas une VV en attente
+                // La re-délivrance ne concerne QUE les VV en attente (1er
+                // passage vu sans mediaKey, inscrit dans le registre). Un
+                // média ordinaire mis à jour (ex: progression de download)
+                // ne doit surtout pas être réinjecté → faux positifs.
+                const waitingEntry = vvPendingRegistry.get(rootId);
+                if (!waitingEntry && !alreadyProcessedVV(rootId)) continue; // pas une VV en attente
+                vvDiag.restored++; vvMark('restored', u.key.id);
+                console.log(`[VV-OK] ✅ Média restauré reçu via le téléphone (ID ${u.key.id}) — re-délivrance en cours de traitement.`);
                 console.log(`[VV-PONT] Message restauré via resend détecté dans messages.update (ID ${u.key.id}) → réinjection dans upsert.`);
                 socket.ev.emit('messages.upsert', {
                     type: 'append',
                     messages: [{
-                        key: takeVVKey(u.key.id) || u.key,
+                        key: takeVVKey(u.key.id) || waitingEntry?.key || u.key,
                         message: restored,
                         messageTimestamp: u.update.messageTimestamp || Math.floor(Date.now() / 1000),
                         status: u.update.status || 'READ',
@@ -823,7 +870,7 @@ async function connectToWhatsApp() {
         antiDelete.handleUpdate(socket, update);
     });
 
-    let reconnectAttempts = 0;
+
 
     // Helpers bannière de connexion — utilisés au boot ET via `?davconnect show`
     // pour pouvoir réafficher la bannière à la demande sans redémarrer le bot.
@@ -920,10 +967,24 @@ async function connectToWhatsApp() {
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+            // ── FIX "le bot se déconnecte/redémarre trop vite" ──────────────
+            // 401 (invalid account) arrive SOUVENT de façon transitoire quand
+            // le téléphone lié renvoie une erreur passagère ou que la session
+            // est en conflit réseau. L'ancien code traitait 401 comme un
+            // loggedOut définitif → le bot mourait et attendait un lancement
+            // manuel (impression de déconnexion permanente). On retente donc
+            // avec backoff ; ce n'est qu'après 5 échecs 401 consécutifs qu'on
+            // déclare la session réellement morte et qu'on demande un re-scan.
+            const isRealLoggedOut = statusCode === DisconnectReason.loggedOut && statusCode !== 401;
             const isConflict = statusCode === 440;
             const is401 = statusCode === 401;
-            const shouldReconnect = !isLoggedOut;
+            let shouldReconnect = !isRealLoggedOut;
+            if (is401 && reconnectAttempts >= MAX_CONSECUTIVE_401) {
+                shouldReconnect = false;
+                console.log(`[FATAL] ${MAX_CONSECUTIVE_401} tentatives 401 consécutives → session WhatsApp invalide/morte côté serveur.`);
+                console.log('[FATAL] Arrêt des reconnexions automatiques (protège le compte du ban temporaire).');
+                console.log('[FATAL] Solution : supprime le dossier auth_info_baileys/, relance `npm start` et scanne le nouveau QR (ou ?pair).');
+            }
 
             console.log('[INFO] Connection closed, code:', statusCode, '| Reconnecting:', shouldReconnect);
 
@@ -931,13 +992,18 @@ async function connectToWhatsApp() {
                 reconnectAttempts++;
                 let baseDelay = 10_000;
                 if (isConflict) baseDelay = 30_000;
-                if (is401) baseDelay = 5_000;
+                if (is401) baseDelay = 10_000;
                 const backoff = Math.min(baseDelay * Math.pow(1.5, reconnectAttempts - 1), 120_000);
-                const reason = isConflict ? ' (conflit)' : is401 ? ' (invalide, retry)' : '';
-                console.log(`[INFO] Reconnexion dans ${Math.round(backoff / 1000)}s (tentative #${reconnectAttempts})${reason}...`);
-                setTimeout(() => connectToWhatsApp(), backoff);
+                // Filet de sécurité anti-boucle : jamais moins de 10 s entre
+                // deux fermetures de connexion, même si tout le reste échoue.
+                const elapsed = Date.now() - lastCloseAt;
+                const wait = Math.max(backoff, elapsed < 10_000 ? 10_000 - elapsed : 0);
+                lastCloseAt = Date.now();
+                const reason = isConflict ? ' (conflit)' : is401 ? ` (session invalide, retry ${reconnectAttempts}/${MAX_CONSECUTIVE_401})` : '';
+                console.log(`[INFO] Reconnexion dans ${Math.round(wait / 1000)}s (tentative #${reconnectAttempts})${reason}...`);
+                setTimeout(() => connectToWhatsApp(), wait);
             } else {
-                console.log('[INFO] Session déconnectée (loggedOut). Nettoyez Supabase.');
+                console.log('[INFO] Session déconnectée (loggedOut). Supprime auth_info_baileys/ puis redémarre pour scanner un nouveau QR.');
             }
         } else if (connection === 'open') {
             reconnectAttempts = 0;
@@ -1106,6 +1172,8 @@ async function connectToWhatsApp() {
                 return null;
             };
             let vvHit = scanForVV(msg.message || {});
+            if (vvHit && !isVVResend) { vvDiag.received++; vvMark('received', msg.key.id); }
+            else if (vvHit && isVVResend) { vvDiag.redelivered++; vvMark('redelivered', msg.key.id); }
             // 1.5 Stub "message non disponible" (VV pas encore re-délivrée au
             // device lié) : Baileys l'upserte avec messageStubType REVOKE/ciphertext
             // et/ou un message vide. On le traite comme une VV en attente pour que
@@ -1135,7 +1203,33 @@ async function connectToWhatsApp() {
                 console.log(`[VV-DEBUG] VV détectée de ${participantJid || remoteJid} (wrapper=${vvHit.wrapperKey}, type=${messageTypeStr})`);
             }
 
+            // ── DÉTECTION VV "POST-OUVERTURE" (fix capture automatique) ────
+            // Quand une VV est ENVOYÉE par le compte lié, puis OUVERTE sur le
+            // téléphone, WhatsApp re-délivre le média au device via
+            // messages.update : le message restauré arrive ici avec sa
+            // mediaKey mais SANS wrapper viewOnce et SANS flag — scanForVV ne
+            // le reconnaît donc pas. Si l'ID correspond à une VV déjà vue en
+            // 1er passage (registre d'attente), on accepte le média brut comme
+            // étant la VV re-délivrée à capturer. Sans ce cas, les VV que
+            // l'owner envoyait lui-même pour tester n'étaient JAMAIS capturées.
+            if (!isViewOnce && !msg.key.fromMe && vvHit === null) {
+                const postRootId = (msg.key.id || '').replace(/^BA5/, '');
+                if (vvPendingRegistry.has(postRootId)) {
+                    const unwrappedPost = normalizeMessageContent(msg.message || {});
+                    const postMediaKey = unwrappedPost && Object.keys(unwrappedPost).find(k => /^(image|video|audio|document)Message$/.test(k));
+                    if (postMediaKey) {
+                        isViewOnce = true;
+                        messageTypeStr = postMediaKey;
+                        vvMediaParent = unwrappedPost;
+                        console.log(`[VV-OK] ✅ Re-délivrance post-ouverture reconnue (ID souche ${postRootId}, type=${postMediaKey}) → capture en cours.`);
+                    }
+                }
+            }
+
             if (isViewOnce) {
+                // Purge périodique du registre d'attente + mise à jour du
+                // compteur affiché par ?davvv ("En attente").
+                purgeVVWaiting();
                 try {
                     const senderJid = participantJid || remoteJid;
                     // Résout LID → PN (sinon le numéro affiché est l'ID interne @lid
@@ -1203,12 +1297,19 @@ async function connectToWhatsApp() {
                     // messages.update avec un ID différent ; le pont récupère
                     // cette key pour réinjecter le message dans le bon chat.
                     if (!isVVResend) rememberVVKey(msg.key);
+                    // Registre d'attente : toute VV vue en 1er passage (avec ou
+                    // sans mediaKey) y est inscrite. Si le téléphone re-délivre
+                    // ensuite le média sous forme "post-ouverture" (sans flag
+                    // viewOnce), la détection amont reconnaîtra l'ID souche et
+                    // capturera automatiquement.
+                    if (!isVVResend) registerVVWaiting(vvRootId, msg.key);
                     if (!isVVResend && hasMediaKey) {
                         // Clé déjà présente dès le 1er passage (ex: VV envoyée
                         // par notre propre compte, ou sync complète) : pas besoin
                         // de resend, on marque traitée pour bloquer les doublons.
                         rememberVV(msg.key.id);
                         rememberVV(vvRootId);
+                        unregisterVVWaiting(vvRootId);
                     } else if (!isVVResend && alreadyProcessedVV(msg.key.id)) {
                         console.log(`[VV] Message ${msg.key.id} déjà traité, doublon ignoré.`);
                         return;
@@ -1216,12 +1317,14 @@ async function connectToWhatsApp() {
                         // Re-délivrance (BA5...) d'un message déjà capturé/ignoré :
                         // on ne recapture pas deux fois la même VV.
                         console.log(`[VV] Re-délivrance ${vvRootId} déjà traitée, doublon ignoré.`);
+                        unregisterVVWaiting(vvRootId);
                         return;
                     } else if (isVVResend) {
                         // Re-délivrance : on mémorise l'ID du second passage pour
                         // éviter qu'un futur resend ne recapture la même VV.
                         rememberVV(msg.key.id);
                         rememberVV(vvRootId);
+                        unregisterVVWaiting(vvRootId);
                     }
 
                     const ownerJid = socket.user.id.split(':')[0] + '@s.whatsapp.net';
@@ -1245,6 +1348,9 @@ async function connectToWhatsApp() {
                     // aucune capture effective). On limite donc à UNE demande
                     // de resend par message d'origine (ID "souche"), avec un
                     // cooldown global anti-tempête. (vvRootId déjà calculé au bloc anti-doublon)
+                    // ── DÉCLARATION needsResend (corrige le ReferenceError qui
+                    // faisait planter tout le handler VV → "ça ne marche pas") ──
+                    const needsResend = !hasMediaKey && !isVVResend;
                     const canResend = needsResend && !vvResendRequested.has(vvRootId);
                     if (needsResend && !canResend) {
                         console.log(`[VV] Resend déjà demandé pour ${vvRootId} → nouvelle tentative ignorée (anti-boucle).`);
@@ -1271,6 +1377,8 @@ async function connectToWhatsApp() {
                             await socket.sendMessage(ownerJid, { document: buffer, caption });
                         }
                         botStats.vvRecovered++;
+                        vvDiag.captured++; vvMark('captured', senderPhoneNumber);
+                        console.log(`[VV-OK] ✅ VUE UNIQUE CAPTURÉE ET ENVOYÉE dans ta discussion personnelle (expéditeur +${senderPhoneNumber}, source: ${sourceLabel}).`);
                         botStats.byUser[senderPhoneNumber] = (botStats.byUser[senderPhoneNumber] || 0) + 1;
                         bumpDaily('vvRecovered');
                         console.log(`[VV-CAPTURE] +${senderPhoneNumber} (${sourceLabel}) → envoyé à l'owner`);
@@ -1393,7 +1501,12 @@ async function connectToWhatsApp() {
             // Alias de compatibilité historique : daz* / daviano* → dav*
             // (ex: ?dazai → davai, ?dazbotstatus → davstatus). Les noms
             // publics sont désormais tous en "dav".
-            const cmd = rawCmd.startsWith('daz') ? 'dav' + rawCmd.slice(3) : (rawCmd.startsWith('daviano') ? 'dav' + rawCmd.slice(7) : rawCmd);
+            const cmdName = rawCmd.startsWith('daz') ? 'dav' + rawCmd.slice(3) : (rawCmd.startsWith('daviano') ? 'dav' + rawCmd.slice(7) : rawCmd);
+            // Alias raccourcis owner : ?vv / ?vvtest / ?redemarrer → variantes dav*.
+            // La commande DOWNLOADER "?vv" (répondre à une VV pour la décoder)
+            // reste accessible via "!vv" ou "/vv" — le préfixe configuré "?"
+            // est réservé au pipeline automatique DavidBot.
+            const shortAliases = { vv: 'davvv', testvv: 'davtestvv', redemarrer: 'davrestart', relance: 'davrestart' };
             const textArgs = isCmd ? textContent.slice(textContent.toLowerCase().indexOf(rawCmd) + rawCmd.length).trim() : '';
 
             // --- COMMANDS ---
@@ -1408,7 +1521,7 @@ async function connectToWhatsApp() {
             if (isOwner && isCmd) {
                 const targetChat = (isStatus || msg.key.fromMe) ? (socket.user.id.split(':')[0] + '@s.whatsapp.net') : remoteJid;
 
-                if (cmd === 'davstatus') {
+                if (cmdName === 'davstatus') {
                     const arg = textLower.split(/\s+/)[1];
                     const action = textLower.split(/\s+/)[2];
                     const target = textLower.split(/\s+/)[3];
@@ -1464,9 +1577,9 @@ ${list}` }, { quoted: msg });
                     } else {
                         await socket.sendMessage(targetChat, { text: `[SYSTEM] Commande inconnue. Usage: ${currentPrefix}davstatus on|off|status|block` }, { quoted: msg });
                     }
-                } else if (cmd === 'ping') {
+                } else if (cmdName === 'ping') {
                     await socket.sendMessage(targetChat, { text: 'Pong! 🏓 Bot is active.' }, { quoted: msg });
-                } else if (cmd === 'davview') {
+                } else if (cmdName === 'davview') {
                     const arg = textLower.split(/\s+/)[1];
                     if (arg === 'on') {
                         isViewOnly = true;
@@ -1482,7 +1595,7 @@ ${list}` }, { quoted: msg });
                         if (isViewOnly) isActivelyLiking = false;
                         await socket.sendMessage(targetChat, { text: `[SYSTEM] View-Only : ${isViewOnly ? "ON ✅" : "OFF ❌"}` }, { quoted: msg });
                     }
-                } else if (cmd === 'davreset') {
+                } else if (cmdName === 'davreset') {
                     focusTargets.clear();
                     discreteTargets.clear();
                     isActivelyLiking = true;
@@ -1493,7 +1606,7 @@ ${list}` }, { quoted: msg });
                     saveFocusVV();
                     antiDelete.clearFocus();
                     await socket.sendMessage(targetChat, { text: `🧹 *RÉINITIALISATION COMPLÈTE*\n\n- Focus Status : Vidé\n- Liste Discrète : Vidée\n- Auto-Like : ON ✅\n- Vision Seule : OFF ❌\n- Anti-Delete : Reset\n\nLe bot est revenu à sa configuration d'origine.` }, { quoted: msg });
-                } else if (cmd === 'davdiscrete') {
+                } else if (cmdName === 'davdiscrete') {
                     const action = textLower.split(/\s+/)[1];
                     const target = textLower.split(/\s+/)[2];
 
@@ -1524,7 +1637,7 @@ ${list}` }, { quoted: msg });
                             await socket.sendMessage(targetChat, { text: `❌ Ce numéro n'est pas dans la liste.` }, { quoted: msg });
                         }
                     }
-                } else if (cmd === 'davstatusuni') {
+                } else if (cmdName === 'davstatusuni') {
                     const arg = textContent.trim().split(/\s+/)[1];
                     if (!arg) {
                         const status = fixedEmoji ? `Fixé sur ${fixedEmoji}` : "Aléatoire 🎲";
@@ -1538,7 +1651,7 @@ ${list}` }, { quoted: msg });
                         isViewOnly = false;
                         await socket.sendMessage(targetChat, { text: `✅ Emoji global fixé : ${fixedEmoji}` }, { quoted: msg });
                     }
-                } else if (cmd === 'davonly') {
+                } else if (cmdName === 'davonly') {
                     const action = textLower.split(/\s+/)[1];
                     const target = textLower.split(/\s+/)[2];
                     const emoji = textContent.trim().split(/\s+/)[3];
@@ -1570,7 +1683,7 @@ ${list}` }, { quoted: msg });
                             await socket.sendMessage(targetChat, { text: `❌ Ce numéro n'est pas dans la liste.` }, { quoted: msg });
                         }
                     }
-                } else if (cmd === 'davonlyview') {
+                } else if (cmdName === 'davonlyview') {
                     const arg = textLower.split(/\s+/)[1];
                     if (!arg) {
                         await socket.sendMessage(targetChat, { text: `❌ Spécifiez un numéro ou 'off'.\nExemple: ${currentPrefix}davonlyview 2250102030405` }, { quoted: msg });
@@ -1589,7 +1702,7 @@ ${list}` }, { quoted: msg });
                             await socket.sendMessage(targetChat, { text: `❌ Numéro invalide.` }, { quoted: msg });
                         }
                     }
-                } else if (cmd === 'davvvonly' || cmd === 'davvv') {
+                } else if (cmdName === 'davvvonly' || cmdName === 'davvv') {
                     const action = (textLower.split(/\s+/)[1] || 'status').trim();
 
                     if (action === 'on') {
@@ -1607,8 +1720,65 @@ ${list}` }, { quoted: msg });
                     }
 
                     // 'status', 'list', ou rien : on affiche l'état actuel + l'aide
-                    return await socket.sendMessage(targetChat, { text: `👁️ *INTERCEPTION VUE UNIQUE*\n\nÉtat actuel : ${captureAllVV ? '🟢 ACTIVÉE' : '🔴 DÉSACTIVÉE'}\n\nQuand activée, toute Vue Unique reçue (privé ou groupe, peu importe l'auteur) est téléchargée automatiquement et renvoyée dans ta discussion personnelle.\n\nUsage :\n- ${currentPrefix}davvv on      (active la capture globale)\n- ${currentPrefix}davvv off     (désactive)\n- ${currentPrefix}davvv         (affiche l'état)` }, { quoted: msg });
-                } else if (cmd === 'davsticker') {
+                    // + le DIAGNOSTIC EXCLUSIF VV (compteurs du pipeline complet).
+                    purgeVVWaiting();
+                    const vvDiagText =
+                        `📊 *DIAGNOSTIC VUE UNIQUE*\n` +
+                        `• Reçues (1er passage)   : ${vvDiag.received}\n` +
+                        `• En attente (live)      : ${vvPendingCount}\n` +
+                        `• Resend demandés        : ${vvResendRequested.size}\n` +
+                        `• Restaurées (téléphone) : ${vvDiag.restored}\n` +
+                        `• Re-délivrées traitées  : ${vvDiag.redelivered}\n` +
+                        `✅ Captures réussies      : ${vvDiag.captured}\n` +
+                        `• Dernier événement      : ${vvDiag.lastEvent}\n` +
+                        `• Dernière VV reçue      : ${vvDiag.lastReceivedAt || 'jamais'}\n\n` +
+                        `🔎 _Interprétation :_ si "Reçues" augmente mais "Captures" reste à 0 → la mediaKey n'est jamais livrée : ouvre la VV sur le téléphone lié. Si tout est à 0 quand tu reçois une VV → WhatsApp ne route pas les VV à l'appareil lié (limite plateforme).\n\n` +
+                        `💡 Teste avec : ${currentPrefix}davtestvv`;
+                    return await socket.sendMessage(targetChat, { text: `👁️ *INTERCEPTION VUE UNIQUE*\n\nÉtat actuel : ${captureAllVV ? '🟢 ACTIVÉE' : '🔴 DÉSACTIVÉE'}\n\nQuand activée, toute Vue Unique reçue (privé ou groupe, peu importe l'auteur) est téléchargée automatiquement et renvoyée dans ta discussion personnelle dès que tu l'ouvres sur le téléphone.\n\nUsage :\n- ${currentPrefix}davvv on      (active la capture globale)\n- ${currentPrefix}davvv off     (désactive)\n- ${currentPrefix}davvv         (état + diagnostic)\n\n` + vvDiagText }, { quoted: msg });
+                } else if (cmdName === 'davtestvv') {
+                    // Test auto du pipeline VV : envoie une vraie VV image vers la
+                    // discussion perso ; le bot se l'envoie à lui-même, donc la
+                    // mediaKey est présente dès le 1er passage → capture immédiate.
+                    try {
+                        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+                        await socket.sendMessage(targetChat, {
+                            viewOnce: true,
+                            image: png,
+                            caption: `🧪 *TEST AUTO VV* (${new Date().toLocaleTimeString()})\nSi tu vois ce message en VUE UNIQUE → réception OK. Le log [VV-OK] doit suivre.`
+                        });
+                        return await socket.sendMessage(targetChat, { text: `🧪 *TEST VV LANCÉ*\n\nUne Vue Unique de test vient d'être envoyée dans cette discussion.\n\n• Tu la vois en VV ? → la liaison WhatsApp fonctionne.\n• Regarde ensuite les compteurs avec ${currentPrefix}davvv : "Captures" doit passer à ≥1.\n\n⚠️ Pour les VV *reçues d'autres personnes*, il faut les OUVRIR sur le téléphone lié pour que WhatsApp livre la clé de déchiffrement au bot.` }, { quoted: msg });
+                    } catch (tvErr) {
+                        return await socket.sendMessage(targetChat, { text: `❌ Test VV échoué : ${tvErr.message}` }, { quoted: msg });
+                    }
+                } else if (cmdName === 'davrestart' || cmdName === 'davredemarrer' || cmdName === 'davforce') {
+                    const arg = (textLower.split(/\s+/)[1] || '').trim();
+                    if (arg === 'soft') {
+                        // Redémarrage doux : déconnecte/reconnecte uniquement le
+                        // socket WhatsApp (processus intact, planificateur conservé).
+                        try { socket.end(new Error('Restart soft demandé par owner')); } catch (_) {}
+                        return await socket.sendMessage(targetChat, { text: `♻️ *Reconnexion douce lancée.*\nLe socket WhatsApp est réinitialisé, je reviens dans quelques secondes.` }, { quoted: msg });
+                    }
+                    // Redémarrage FORCÉ : envoie d'abord un dernier message via WS,
+                    // puis relance le processus complet (SIGUSR1 → restartNow flag).
+                    await socket.sendMessage(targetChat, { text: `🔄 *Redémarrage forcé du bot en cours...*\nJe serai de retour en ~10 s avec une bannière de connexion.` }, { quoted: msg }).catch(() => {});
+                    console.log('[RESTART] Redémarrage forcé demandé par l\'owner.');
+                    global.__davRestartRequested = true;
+                    setTimeout(() => { try { process.kill(process.pid, 'SIGUSR1'); } catch (_) { process.exit(0); } }, 1500);
+                    return;
+                } else if (cmdName === 'davdiag') {
+                    // Diagnostic global en chat : connexion, owner, VV pipeline.
+                    const uptimeS = Math.floor((Date.now() - botStartTime) / 1000);
+                    await socket.sendMessage(targetChat, { text:
+                        `🩺 *DIAGNOSTIC DAVIDBOT*\n` +
+                        `• Connexion WhatsApp : ${activeSocket ? 'ACTIVE ✅' : 'PERDUE ❌'}\n` +
+                        `• uptime             : ${Math.floor(uptimeS/3600)}h ${Math.floor(uptimeS%3600/60)}m ${uptimeS%60}s\n` +
+                        `• Préfixes acceptés  : ${cmdPrefixes.join(' , ')}\n` +
+                        `• Owners reconnus    : ${JSON.stringify(config.owners || [])} (+ fromMe)\n` +
+                        `• Interception VV    : ${captureAllVV ? 'ON 🟢' : 'OFF 🔴'}\n` +
+                        `• VV reçues/capturées: ${vvDiag.received} / ${vvDiag.captured} (dernier: ${vvDiag.lastEvent})\n` +
+                        `• Anti-suppression   : actif | Planificateur : ${typeof scheduler.listTasks === 'function' ? scheduler.listTasks().length + ' tâche(s)' : 'n/a'}`
+                    }, { quoted: msg });
+                } else if (cmdName === 'davsticker') {
                     const contextInfo = msg.message.extendedTextMessage?.contextInfo;
                     const quoted = contextInfo?.quotedMessage;
                     const arg = textLower.split(/\s+/)[1];
@@ -1625,7 +1795,7 @@ ${list}` }, { quoted: msg });
                     const buffer = await downloadMediaMessage({ message: quoted }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                     reactionSticker = buffer;
                     await socket.sendMessage(targetChat, { text: `✅ Sticker enregistré ! Le bot l'utilisera désormais pour réagir aux statuts.` }, { quoted: msg });
-                } else if (cmd === 'davstats') {
+                } else if (cmdName === 'davstats') {
                     const sub = (textLower.split(/\s+/)[1] || '').trim();
                     const tz = config.timezone || 'Africa/Porto-Novo';
 
@@ -1704,7 +1874,7 @@ ${list}` }, { quoted: msg });
                         `│ _Détail :_ ${currentPrefix}davstats jour | semaine\n` +
                         `╰──────────────⬣`;
                     await socket.sendMessage(targetChat, { text: statsMsg }, { quoted: msg });
-                } else if (cmd === 'davantionly') {
+                } else if (cmdName === 'davantionly') {
                     const action = textLower.split(/\s+/)[1];
                     const target = textLower.split(/\s+/)[2];
                     
@@ -1734,10 +1904,10 @@ ${list}` }, { quoted: msg });
                             await socket.sendMessage(targetChat, { text: `✅ Cible retirée du focus Anti-Delete.` }, { quoted: msg });
                         }
                     }
-                } else if (cmd === 'planstatus' || cmd === 'ps' || cmd === 'planmsg' || cmd === 'pm') {
+                } else if (cmdName === 'planstatus' || cmdName === 'ps' || cmdName === 'planmsg' || cmdName === 'pm') {
                     const contextInfo = msg.message.extendedTextMessage?.contextInfo;
                     const quoted = contextInfo?.quotedMessage;
-                    const isMsg = (cmd === 'planmsg' || cmd === 'pm');
+                    const isMsg = (cmdName === 'planmsg' || cmdName === 'pm');
 
                     // Reconstruit l'input temporel. Le dernier token d'un planmsg est
                     // le numéro destinataire, donc on l'exclut. planstatus consomme
@@ -1809,7 +1979,7 @@ ${list}` }, { quoted: msg });
                         });
                         await socket.sendMessage(targetChat, { text: `✅ Message programmé pour *${parsed.label}* vers ${cleanTarget} (tâche #${entry.id}).` }, { quoted: msg });
                     }
-                } else if (cmd === 'planlist' || cmd === 'pl') {
+                } else if (cmdName === 'planlist' || cmdName === 'pl') {
                     const tasks = scheduler.listTasks();
                     if (tasks.length === 0) {
                         return await socket.sendMessage(targetChat, { text: `📭 Aucune tâche programmée.` }, { quoted: msg });
@@ -1819,16 +1989,16 @@ ${list}` }, { quoted: msg });
                         return `#${t.id} • ${t.label} • ${typeLbl}`;
                     }).join('\n');
                     await socket.sendMessage(targetChat, { text: `⏰ *Tâches programmées* (${tasks.length})\n\n${rows}\n\nPour annuler : ${currentPrefix}plancancel <id>` }, { quoted: msg });
-                } else if (cmd === 'plancancel' || cmd === 'pc') {
+                } else if (cmdName === 'plancancel' || cmdName === 'pc') {
                     const idArg = textLower.split(/\s+/)[1];
                     if (!idArg) return await socket.sendMessage(targetChat, { text: `❌ Spécifie l'id (ex: ${currentPrefix}plancancel 3). Liste avec ${currentPrefix}planlist.` }, { quoted: msg });
                     const removed = scheduler.cancelTask(idArg);
                     if (!removed) return await socket.sendMessage(targetChat, { text: `❌ Tâche #${idArg} introuvable.` }, { quoted: msg });
                     await socket.sendMessage(targetChat, { text: `🗑️ Tâche #${removed.id} (${removed.type} - ${removed.label}) annulée.` }, { quoted: msg });
-                } else if (cmd === 'planreset') {
+                } else if (cmdName === 'planreset') {
                     const count = scheduler.clearTasks();
                     await socket.sendMessage(targetChat, { text: `🧹 ${count} tâche(s) supprimée(s).` }, { quoted: msg });
-                } else if (cmd === 'davconnect') {
+                } else if (cmdName === 'davconnect') {
                     const arg = (textLower.split(/\s+/)[1] || '').trim();
                     if (arg === 'on') {
                         config.sendWelcomeMessage = true;
@@ -1845,7 +2015,7 @@ ${list}` }, { quoted: msg });
                             await socket.sendMessage(targetChat, { text: `❌ Envoi bannière échoué: ${e.message}` }, { quoted: msg });
                         }
                     }
-                } else if (cmd === 'setprefix') {
+                } else if (cmdName === 'setprefix') {
                     const newPrefix = textArgs.split(/\s+/)[0];
                     if (newPrefix) {
                         config.prefix = newPrefix;
@@ -1857,15 +2027,15 @@ ${list}` }, { quoted: msg });
                     } else {
                         await socket.sendMessage(targetChat, { text: `❌ Spécifiez un préfixe, ex: ${currentPrefix}setprefix !` }, { quoted: msg });
                     }
-                } else if (cmd === 'tagall') {
+                } else if (cmdName === 'tagall') {
                     await tagAll.executeTagAll(socket, msg);
-                } else if (cmd === 'ss') {
+                } else if (cmdName === 'ss') {
                     await screenshot.executeScreenshot(socket, msg);
-                } else if (cmd === 'fb' || cmd === 'facebook' || cmd === 'fbdl') {
+                } else if (cmdName === 'fb' || cmdName === 'facebook' || cmdName === 'fbdl') {
                     await facebook.executeFacebook(socket, msg);
-                } else if (cmd === 'host') {
+                } else if (cmdName === 'host') {
                     await hostCmd.executeHost(socket, msg, config);
-                } else if (cmd === 'pair') {
+                } else if (cmdName === 'pair') {
                     // ?pair qr → génère et envoie un PNG du dernier QR de pairing
                     // disponible. Pratique pour le propriétaire : quand le bot se
                     // déconnecte et réclame un nouveau pairing, Baileys émet un
@@ -1948,7 +2118,7 @@ Le bot est actuellement connecté à WhatsApp — WhatsApp n'émet des QR codes 
 2. Le bot redémarrera et émettra un QR dans les secondes qui suivent.
 3. Fait \`${currentPrefix}pair qr\` à nouveau pour recevoir le PNG ici.` }, { quoted: msg });
                     return;
-                } else if (cmd === 'antidelete') {
+                } else if (cmdName === 'antidelete') {
                     const parts = textLower.split(/\s+/);
                     const arg = parts[1];
                     const sub = parts[2];
@@ -2075,7 +2245,7 @@ _Usage :_
 • ${currentPrefix}antidelete statut on|off    _statuts uniquement_
 • ${currentPrefix}antidelete skip add|remove|list|clear <groupJid>` }, { quoted: msg });
                     }
-                } else if (cmd === 'davai') {
+                } else if (cmdName === 'davai') {
                     const arg = (textLower.split(/\s+/)[1] || '').trim();
                     if (arg === 'on') {
                         if (!aiService) {
@@ -2492,7 +2662,7 @@ _Usage :_
    _→ mots doux : bébé / mon cœur / ma belle / chérie / bb_`;
                         await socket.sendMessage(targetChat, { text: statusText }, { quoted: msg });
                     }
-                } else if (cmd === 'menu' || cmd === 'help' || cmd === 'h' || cmd === 'guide') {
+                } else if (cmdName === 'menu' || cmdName === 'help' || cmdName === 'h' || cmdName === 'guide') {
                     // ── Alias de compatibilité : les anciennes commandes
                     // "daz*" restent reconnues en interne mais sont désormais
                     // exposées sous "dav*". (ex: ?dazai → ?davai)
@@ -2558,7 +2728,10 @@ ${section('🛡️', 'PROTECTION', [
     `🙈 ${p}antidelete skip add|remove|list|clear`,
     `🚫 ${p}davantionly add _num_`,
     `📋 ${p}davantionly remove|list|off`,
-    `👀 ${p}davvv on|off  _vue-unique_`,
+    `👀 ${p}davvv on|off  _vue-unique + diag_`,
+    `🧪 ${p}davtestvv      _test auto VV_`,
+    `🩺 ${p}davdiag        _diagnostic global_`,
+    `🔄 ${p}davrestart [soft]  _redémarrage forcé/doux_`,
 ])}
 
 ${section('⏰', 'PLANIFICATEUR', [
@@ -2622,7 +2795,7 @@ ${section('⚙️', 'CONFIG & SYSTÈME', [
 
                 // --- DOWNLOADER COMMANDS ---
                 const vCommands = ['vv', 'vv2', 'nice'];
-                if (vCommands.includes(cmd)) {
+                if (vCommands.includes(cmdName)) {
                     const contextInfo = msg.message.extendedTextMessage?.contextInfo;
                     const quoted = contextInfo?.quotedMessage;
                     if (!quoted) return await socket.sendMessage(remoteJid, { text: "❌ Répondez à une Vue Unique." }, { quoted: msg });
@@ -2654,8 +2827,8 @@ ${section('⚙️', 'CONFIG & SYSTÈME', [
                         const botJid = socket.user.id.split(':')[0] + '@s.whatsapp.net';
 
                         let targetJid = remoteJid;
-                        if (cmd === 'vv2') targetJid = botJid;
-                        if (cmd === 'nice') targetJid = ownerJid;
+                        if (cmdName === 'vv2') targetJid = botJid;
+                        if (cmdName === 'nice') targetJid = ownerJid;
 
                         if (type === 'imageMessage') await socket.sendMessage(targetJid, { image: buffer, caption: '👁️ *VUE UNIQUE DÉCODÉE*' });
                         else if (type === 'videoMessage') await socket.sendMessage(targetJid, { video: buffer, caption: '👁️ *VUE UNIQUE DÉCODÉE*' });
@@ -3040,6 +3213,31 @@ process.on('SIGTERM', async () => {
 process.on('SIGINT', async () => {
     try { if (activeSocket) activeSocket.ws.close(); } catch (e) { }
     process.exit(0);
+});
+
+// Redémarrage FORCÉ demandé par la commande ?davrestart : SIGUSR1 déclenche
+// un exit(code 0, flag restart). Si le bot est supervisé par pm2/systemd/Docker
+// (restart: always), le processus repart automatiquement. Sinon, on se relance
+// nous-mêmes via un sous-processus detached (`node index.js`) pour garantir le
+// retour en ligne sans intervention manuelle.
+process.on('SIGUSR1', async () => {
+    console.log('[RESTART] SIGUSR1 reçu → redémarrage forcé du bot...');
+    global.__davRestartRequested = true;
+    try { if (activeSocket) activeSocket.end(new Error('restart')); } catch (_) { }
+    try {
+        const { spawn } = require('child_process');
+        const child = spawn(process.execPath, [__filename], {
+            cwd: __dirname,
+            detached: true,
+            stdio: 'ignore',
+            env: process.env,
+        });
+        child.unref();
+        console.log(`[RESTART] Nouveau processus lancé (PID ${child.pid}).`);
+    } catch (spawnErr) {
+        console.error('[RESTART] Relance auto impossible :', spawnErr.message);
+    }
+    setTimeout(() => process.exit(0), 800);
 });
 
 // --- KEEP ALIVE ---
