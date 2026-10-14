@@ -332,6 +332,35 @@ setInterval(() => {
     if (vvResendRequested.size > 1000) vvResendRequested.clear();
 }, 60 * 1000).unref?.();
 
+// ── FIX CRITIQUE VV (cause racine de "ça ne récupère pas") ──────────────
+// La re-délivrance du téléphone après un resend de placeholder N'ARRIVE PAS
+// dans `messages.upsert` : Baileys la livre via `messages.update` (le PDO
+// response remplit le message stub en local). Tout le pipeline de capture
+// était donc branché sur le mauvais événement → aucune VV jamais capturée.
+// Ce pont réinjecte les messages restaurés dans le flux upsert, marqués
+// __BaileysPlaceholderResend pour que la logique existante les reconnaisse.
+const vvPendingKeys = new Map(); // id souche -> { key, at }
+const VV_PENDING_TTL_MS = 15 * 60 * 1000;
+const rememberVVKey = (key) => {
+    const rootId = (key?.id || '').replace(/^BA5/, '');
+    if (!rootId) return;
+    vvPendingKeys.set(rootId, { key, at: Date.now() });
+    if (vvPendingKeys.size > 300) {
+        const now = Date.now();
+        for (const [k, v] of vvPendingKeys) {
+            if (now - v.at > VV_PENDING_TTL_MS) vvPendingKeys.delete(k);
+        }
+    }
+};
+const takeVVKey = (id) => {
+    const rootId = (id || '').replace(/^BA5/, '');
+    const entry = vvPendingKeys.get(rootId);
+    if (!entry) return null;
+    vvPendingKeys.delete(rootId);
+    if (Date.now() - entry.at > VV_PENDING_TTL_MS) return null;
+    return entry.key;
+};
+
 let isActivelyLiking = true;
 let fixedEmoji = null;
 let focusTargets = new Map(); // Store JID -> { emoji: string }
@@ -444,6 +473,11 @@ const getStatusAudience = async () => {
 // Statistiques du bot. `daily` = map YYYY-MM-DD (tz config.timezone,
 // par défaut Africa/Porto-Novo = UTC+1) → compteurs du jour.
 // Utilisé par ?davstats jour / ?davstats semaine.
+// Compteur de "Vues en attente" : messages VV détectés sans mediaKey (stub ou
+// placeholder) pour lesquels une re-délivrance est espérée via le pont
+// messages.update → upsert. Affiché par ?davvv (diagnostic).
+let vvPendingCount = 0;
+
 const botStats = {
     statusRead: 0,
     statusReacted: 0,
@@ -755,6 +789,37 @@ async function connectToWhatsApp() {
                 console.log(`[DEBUG-UPDATE] ID: ${u.key.id}, Stub: ${u.update.messageStubType}, Protocol: ${!!u.update.message?.protocolMessage}`);
             }
         });
+        // ── PONT VV : la re-délivrance placeholder arrive ICI (pas dans
+        // messages.upsert). Quand un stub "message non disponible" est mis à
+        // jour avec le message réel (avec mediaKey), on réinjecte le message
+        // complet dans le flux upsert pour que le pipeline de capture VV le
+        // traite normalement. Sans ce pont, aucune VV n'était jamais capturée.
+        try {
+            for (const u of update) {
+                const restored = u.update?.message;
+                if (!restored || !u.key?.id) continue;
+                const hasMedia = Object.keys(restored).some(k =>
+                    /^(image|video|audio|document)Message$/.test(k) ||
+                    /^viewOnceMessage/.test(k) ||
+                    k === 'ephemeralMessage' || k === 'deviceSentMessage');
+                if (!hasMedia) continue;
+                const rootId = u.key.id.replace(/^BA5/, '');
+                if (!alreadyProcessedVV(rootId)) continue; // pas une VV en attente
+                console.log(`[VV-PONT] Message restauré via resend détecté dans messages.update (ID ${u.key.id}) → réinjection dans upsert.`);
+                socket.ev.emit('messages.upsert', {
+                    type: 'append',
+                    messages: [{
+                        key: takeVVKey(u.key.id) || u.key,
+                        message: restored,
+                        messageTimestamp: u.update.messageTimestamp || Math.floor(Date.now() / 1000),
+                        status: u.update.status || 'READ',
+                        __BaileysPlaceholderResend: true
+                    }]
+                });
+            }
+        } catch (bridgeErr) {
+            console.warn('[VV-PONT] Erreur pont messages.update → upsert :', bridgeErr.message);
+        }
         antiDelete.handleUpdate(socket, update);
     });
 
@@ -1041,6 +1106,16 @@ async function connectToWhatsApp() {
                 return null;
             };
             let vvHit = scanForVV(msg.message || {});
+            // 1.5 Stub "message non disponible" (VV pas encore re-délivrée au
+            // device lié) : Baileys l'upserte avec messageStubType REVOKE/ciphertext
+            // et/ou un message vide. On le traite comme une VV en attente pour que
+            // la key soit mémorisée et le pont messages.update puisse capturer la
+            // re-délivrance.
+            if (!vvHit && !msg.key.fromMe && captureAllVV &&
+                (msg.messageStubParameters?.some(p => typeof p === 'string' && /non disponible|not available/i.test(p)) ||
+                 (msg.message && Object.keys(msg.message).length === 0))) {
+                vvHit = { mediaKey: 'CIPHERTEXT', mediaParent: null, wrapperKey: 'stub' };
+            }
             // 2. Forme "post-ouverture" : le téléphone renvoie le média sans le
             //    wrapper viewOnce (flag retiré) mais avec forceResize/surface ou
             //    via le marquage __BaileysPlaceholderResend. On accepte alors le
@@ -1100,6 +1175,18 @@ async function connectToWhatsApp() {
                     // Le message re-décoré repasse ensuite dans messages.upsert
                     // — c'est ce second passage qui capture réellement le média.
                     const hasMediaKey = !!(vvMediaParent && vvMediaParent[messageTypeStr]?.mediaKey);
+                    // ── DÉTECTION STUB CIPHERTEXT (VV non livrée au device lié) ──
+                    // Baileys v7 upserte un stub "Message non disponible" quand la
+                    // VV arrive sans contenu déchiffrable, et émet le resend PDO
+                    // automatiquement. On reconnaît ce cas pour (1) mémoriser la
+                    // clé en attente du message restauré (voir pont messages.update),
+                    // (2) éviter les faux téléchargements, (3) loguer clairement.
+                    const isUnavailableStub = !!(msg.messageStubParameters?.some(p => typeof p === 'string' && /non disponible|not available|placeholder/i.test(p))
+                        || (msg.message && Object.keys(msg.message).length === 0));
+                    if (isUnavailableStub && !hasMediaKey) {
+                        messageTypeStr = 'CIPHERTEXT';
+                        console.log(`[VV-DEBUG] Stub VV non déchiffrable détecté (ID ${msg.key.id}) — resend automatique Baileys, capture à la re-délivrance.`);
+                    }
                     // ── FIX CRITIQUE (boucle de resend) ───────────────────────
                     // La re-délivrance du téléphone arrive avec un key.id
                     // DIFFÉRENT (préfixe "BA5") : l'anti-doublon par ID ne la
@@ -1110,6 +1197,12 @@ async function connectToWhatsApp() {
                     // On mémorise donc l'ID "souche" (BA5 retiré) des messages
                     // déjà traités pour bloquer les doublons au second passage.
                     const vvRootId = (msg.key.id || '').replace(/^BA5/, '');
+                    // Clé en attente pour le pont messages.update → upsert :
+                    // dès qu'un 1er passage (stub ou sans mediaKey) est vu, on
+                    // mémorise sa key complète. La re-délivrance arrive via
+                    // messages.update avec un ID différent ; le pont récupère
+                    // cette key pour réinjecter le message dans le bon chat.
+                    if (!isVVResend) rememberVVKey(msg.key);
                     if (!isVVResend && hasMediaKey) {
                         // Clé déjà présente dès le 1er passage (ex: VV envoyée
                         // par notre propre compte, ou sync complète) : pas besoin
@@ -1191,6 +1284,11 @@ async function connectToWhatsApp() {
                     // __BaileysPlaceholderResend) et c'est là que le média est
                     // réellement capturé.
                     let buffer = null;
+                    if (isUnavailableStub && !hasMediaKey) {
+                        // Rien à télécharger : le contenu viendra avec la
+                        // re-délivrance (pont messages.update → upsert).
+                        console.log(`[VV] Stub en attente de re-délivrance (ID ${vvRootId}) — pas de téléchargement forcé.`);
+                    } else {
                     try {
                         buffer = await downloadMediaMessage(dlMsg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: socket.updateMediaMessage });
                     } catch (dlErr) {
@@ -1239,12 +1337,16 @@ async function connectToWhatsApp() {
                             console.log(`[VV] Média non récupérable (${dlErr.message}) et resend déjà demandé → abandon propre.`);
                         }
                     }
+                    }
                     if (buffer) await sendToOwner(buffer);
                 } catch (e) { console.error("[ERROR] Anti-View-Once failed:", e.message); }
             }
 
             // --- GRACE PERIOD FOR STATUSES (OFFLINE CATCH-UP) ---
-            if (msg.messageTimestamp) {
+            // Exception : les re-délivrances VV (pont messages.update) portent
+            // la timestamp du message ORIGINAL, antérieure au démarrage du bot.
+            // Sans cette exemption, elles seraient jetées par le filtre ci-dessous.
+            if (msg.messageTimestamp && !isVVResend) {
                 const msgTime = typeof msg.messageTimestamp === 'object' && msg.messageTimestamp.toNumber ? msg.messageTimestamp.toNumber() : Number(msg.messageTimestamp);
 
                 if (isStatus) {
