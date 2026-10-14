@@ -42,7 +42,7 @@ const executeFacebook = async (sock, msg) => {
             remoteJid,
             {
                 video: { url: videoUrl },
-                caption: `╭───────◇\n│ 🤖 *DAZBOT FB-DL* 🤖\n╰───────◇\n\n📌 *Titre:* ${title}\n\n> © DazBot`,
+                caption: `╭───────◇\n│ 🤖 *david FB-DL* 🤖\n╰───────◇\n\n📌 *Titre:* ${title}\n\n> © david`,
                 mimetype: 'video/mp4'
             },
             { quoted: msg }

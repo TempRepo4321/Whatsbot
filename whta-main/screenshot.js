@@ -38,7 +38,7 @@ const executeScreenshot = async (sock, msg) => {
             remoteJid,
             {
                 image: Buffer.from(response.data, "binary"),
-                caption: `╭───────◇\n│ 🤖 *DAZBOT SS-WEB* 🤖\n╰───────◇\n\n🔗 *URL:* ${url}\n\n> © DazBot`,
+                caption: `╭───────◇\n│ 🤖 *david SS-WEB* 🤖\n╰───────◇\n\n🔗 *URL:* ${url}\n\n> © david`,
             },
             { quoted: msg }
         );
